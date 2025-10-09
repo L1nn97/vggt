@@ -43,11 +43,14 @@ class Block(nn.Module):
         ffn_layer: Callable[..., nn.Module] = Mlp,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
+        output_attn_map: bool = False,
         rope=None,
     ) -> None:
         super().__init__()
 
         self.norm1 = norm_layer(dim)
+
+        self.output_attn_map = output_attn_map
 
         self.attn = attn_class(
             dim,
@@ -58,6 +61,7 @@ class Block(nn.Module):
             proj_drop=drop,
             qk_norm=qk_norm,
             fused_attn=fused_attn,
+            output_attn_map=output_attn_map,
             rope=rope,
         )
 
@@ -76,7 +80,11 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, pos=None) -> Tensor:
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos))
+            if self.output_attn_map:
+                attn_out, attn_map = self.attn(self.norm1(x), pos=pos)
+                return self.ls1(attn_out), attn_map
+            else:
+                return self.ls1(self.attn(self.norm1(x), pos=pos))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
@@ -205,7 +213,11 @@ class NestedTensorBlock(Block):
         if self.training and self.sample_drop_ratio > 0.0:
 
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.attn(self.norm1(x), attn_bias=attn_bias)
+                if self.output_attn_map:
+                    attn_out, attn_map = self.attn(self.norm1(x), attn_bias=attn_bias)
+                    return attn_out, attn_map
+                else:
+                    return self.attn(self.norm1(x), attn_bias=attn_bias) 
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.mlp(self.norm2(x))
@@ -226,7 +238,11 @@ class NestedTensorBlock(Block):
         else:
 
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
+                if self.output_attn_map:
+                    attn_out, attn_map = self.attn(self.norm1(x), attn_bias=attn_bias)
+                    return self.ls1(attn_out), attn_map
+                else:
+                    return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.ls2(self.mlp(self.norm2(x)))

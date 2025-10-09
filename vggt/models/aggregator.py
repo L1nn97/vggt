@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
+SAVE_IMTERMEDIATE_FLAGS = [
+    "None" "GlobalAttn_BeforeSoftmax",
+    "LocalAttn_BeforeSoftmax",
+    "All",
+]
+
 
 class Aggregator(nn.Module):
     """
@@ -68,6 +74,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        save_intermediate: str = SAVE_IMTERMEDIATE_FLAGS[0],
     ):
         super().__init__()
 
@@ -76,6 +83,12 @@ class Aggregator(nn.Module):
         # Initialize rotary position embedding if frequency > 0
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
+
+        # for zcl test
+        self.save_intermediate_flag = save_intermediate
+
+        self.save_local = self.save_intermediate_flag in ["LocalAttn_BeforeSoftmax", "All"]
+        self.save_global = self.save_intermediate_flag in ["GlobalAttn_BeforeSoftmax", "All"]
 
         self.frame_blocks = nn.ModuleList(
             [
@@ -88,6 +101,8 @@ class Aggregator(nn.Module):
                     ffn_bias=ffn_bias,
                     init_values=init_values,
                     qk_norm=qk_norm,
+                    fused_attn=not self.save_local,  # disable fused_attn when saving attn map
+                    output_attn_map=self.save_local,  # save attn map when saving local attn  ,
                     rope=self.rope,
                 )
                 for _ in range(depth)
@@ -105,6 +120,8 @@ class Aggregator(nn.Module):
                     ffn_bias=ffn_bias,
                     init_values=init_values,
                     qk_norm=qk_norm,
+                    fused_attn=not self.save_global,  # disable fused_attn when saving attn map
+                    output_attn_map=self.save_global,  # save attn map when saving global att
                     rope=self.rope,
                 )
                 for _ in range(depth)
@@ -237,11 +254,11 @@ class Aggregator(nn.Module):
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
-                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+                    tokens, frame_idx, frame_intermediates, intermediates_attn_maps = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
                 elif attn_type == "global":
-                    tokens, global_idx, global_intermediates = self._process_global_attention(
+                    tokens, global_idx, global_intermediates, intermediates_attn_maps = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos
                     )
                 else:
@@ -269,17 +286,19 @@ class Aggregator(nn.Module):
             pos = pos.view(B, S, P, 2).view(B * S, P, 2)
 
         intermediates = []
+        intermediates_attn_maps = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+                tokens, attn_maps = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
+            intermediates_attn_maps.append(attn_maps)
 
-        return tokens, frame_idx, intermediates
+        return tokens, frame_idx, intermediates, intermediates_attn_maps
 
     def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
         """
@@ -292,17 +311,19 @@ class Aggregator(nn.Module):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
         intermediates = []
+        intermediates_attn_maps = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens, attn_maps = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
+            intermediates_attn_maps.append(attn_maps)
 
-        return tokens, global_idx, intermediates
+        return tokens, global_idx, intermediates, intermediates_attn_maps
 
 
 def slice_expand_and_flatten(token_tensor, B, S):
