@@ -106,6 +106,7 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    fused_attn = False,
                 )
                 for _ in range(depth)
             ]
@@ -207,11 +208,11 @@ class Aggregator(nn.Module):
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
-        _, P, C = patch_tokens.shape
+        _, P, C = patch_tokens.shape # (B*S, num_patches, embed_dim)
 
         # Expand camera and register tokens to match batch size and sequence length
-        camera_token = slice_expand_and_flatten(self.camera_token, B, S)
-        register_token = slice_expand_and_flatten(self.register_token, B, S)
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S) # -> (B*S, 1, embed_dim)
+        register_token = slice_expand_and_flatten(self.register_token, B, S) # -> (B*S, 4, embed_dim)
 
         # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)

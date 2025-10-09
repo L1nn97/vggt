@@ -31,7 +31,9 @@ print("Initializing and loading VGGT model...")
 
 model = VGGT()
 _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+# model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+_LOCAL_PRETRAINED_PATH = "/home/rokae/zcl/vggt/checkpoints/model.pt"
+model.load_state_dict(torch.load(_LOCAL_PRETRAINED_PATH))
 
 
 model.eval()
@@ -688,4 +690,4 @@ with gr.Blocks(
         outputs=[reconstruction_output, target_dir_output, image_gallery, log_output],
     )
 
-    demo.queue(max_size=20).launch(show_error=True, share=True)
+    demo.queue(max_size=20).launch(show_error=True, share=True, server_name="0.0.0.0", server_port=7860)

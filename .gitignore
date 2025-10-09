@@ -147,3 +147,11 @@ skyseg.onnx
 # pixi environments
 .pixi
 *.egg-info
+
+
+# my test
+global_attn_heatmap*
+checkpoint
+input_images*
+checkpoints
+.gradio
