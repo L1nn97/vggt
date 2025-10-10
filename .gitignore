@@ -155,3 +155,4 @@ checkpoint
 input_images*
 checkpoints
 .gradio
+agg_attn_maps

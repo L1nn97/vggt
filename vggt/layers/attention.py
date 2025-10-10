@@ -22,9 +22,6 @@ import numpy as np
 
 XFORMERS_AVAILABLE = False
 
-num_global_attn = 0
-
-
 class Attention(nn.Module):
     def __init__(
         self,
@@ -37,6 +34,7 @@ class Attention(nn.Module):
         norm_layer: nn.Module = nn.LayerNorm,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
+        output_attn_map: bool = False,
         rope=None,
     ) -> None:
         super().__init__()
@@ -44,7 +42,10 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
+
+        # for zcl test
         self.fused_attn = fused_attn
+        self.output_attn_map = output_attn_map
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -73,42 +74,25 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
+        attn_before_softmax = None
+
         if self.fused_attn:
             x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
         else:
             q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            global num_global_attn
-            
-            print("attention map shape: ", attn.shape)
-            
-            for i in range(10):
-                row_start = i * 930 + 5
-                row_end = (i + 1) * 930
-                attn_sum = attn[0, :, row_start:row_end, 5 + 12 * 37 + 18]  # shape: [num_heads, 925]
-                attn_sum = attn_sum.sum(dim=0)  # 沿着头维度求和 -> [925]
-                attn_map = attn_sum.cpu().numpy().reshape(25, 37)  # reshape 成空间结构
-
-                current_image = self.images[i].numpy().transpose(1, 2, 0)
-                attn_map_resized = resize_attention_map(attn_map, current_image.shape[:2])
-                overlay_image = apply_heatmap(current_image, attn_map_resized)
-                
-                save_dir = "/home/rokae/zcl/vggt/global_attn_heatmap"
-                save_path = os.path.join(save_dir, f"{num_global_attn}_{i}.png")
-                
-                cv.imwrite(save_path, cv.cvtColor(overlay_image, cv.COLOR_BGR2RGB))
-
-            
-            num_global_attn = num_global_attn + 1
-
-            attn = self.attn_drop(attn)
+            attn_before_softmax = q @ k.transpose(-2, -1)
+            attn_after_softmax = attn_before_softmax.softmax(dim=-1)
+            attn = self.attn_drop(attn_after_softmax)
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
+
+        if self.output_attn_map:
+            return x, attn_before_softmax
+        else:
+            return x
 
 
 class MemEffAttention(Attention):

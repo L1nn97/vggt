@@ -14,7 +14,7 @@ model = VGGT()
 _LOCAL_PRETRAINED_PATH = "/home/rokae/zcl/vggt/checkpoints/model.pt"
 model.load_state_dict(torch.load(_LOCAL_PRETRAINED_PATH))
 model.to(device)
-
+model.eval()
 # Load and preprocess example images (replace with your own image paths)
 image_names = []
 for i in range(10):
@@ -38,3 +38,4 @@ with torch.no_grad():
     with torch.cuda.amp.autocast(dtype=dtype):
         # Predict attributes including cameras, depth maps, and point maps.
         predictions = model(images)
+        print(type(predictions))

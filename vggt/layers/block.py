@@ -43,11 +43,13 @@ class Block(nn.Module):
         ffn_layer: Callable[..., nn.Module] = Mlp,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
+        output_attn_map: bool = False,
         rope=None,
     ) -> None:
         super().__init__()
 
         self.norm1 = norm_layer(dim)
+        self.output_attn_map = output_attn_map
 
         self.attn = attn_class(
             dim,
@@ -58,6 +60,7 @@ class Block(nn.Module):
             proj_drop=drop,
             qk_norm=qk_norm,
             fused_attn=fused_attn,
+            output_attn_map=self.output_attn_map,
             rope=rope,
         )
 
@@ -76,10 +79,18 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, pos=None) -> Tensor:
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos))
+            attn_map = None
+            attn_result = self.attn(self.norm1(x), pos=pos)
+            if isinstance(attn_result, tuple):
+                attn_out, attn_map = attn_result
+            else:
+                attn_out = attn_result
+            return self.ls1(attn_out), attn_map
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
+    
+        attn_map = None
 
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1
@@ -90,12 +101,26 @@ class Block(nn.Module):
                 x, residual_func=ffn_residual_func, sample_drop_ratio=self.sample_drop_ratio
             )
         elif self.training and self.sample_drop_ratio > 0.0:
-            x = x + self.drop_path1(attn_residual_func(x, pos=pos))
+            residual_result = attn_residual_func(x, pos=pos)
+            if isinstance(residual_result, tuple):
+                residual, attn_map = residual_result
+            else:
+                residual = residual_result
+            x = x + self.drop_path1(residual)
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x, pos=pos)
+            residual_result = attn_residual_func(x, pos=pos)
+            if isinstance(residual_result, tuple):
+                residual, attn_map = residual_result
+            else:
+                residual = residual_result
+            x = x + residual
             x = x + ffn_residual_func(x)
-        return x
+
+        if self.output_attn_map:
+            return x, attn_map
+        else:
+            return x
 
 
 def drop_add_residual_stochastic_depth(
@@ -111,9 +136,14 @@ def drop_add_residual_stochastic_depth(
     if pos is not None:
         # if necessary, apply rope to the subset
         pos = pos[brange]
-        residual = residual_func(x_subset, pos=pos)
+        residual_result = residual_func(x_subset, pos=pos)
     else:
-        residual = residual_func(x_subset)
+        residual_result = residual_func(x_subset)
+    # 兼容 residual_func 返回 tuple 或单对象
+    if isinstance(residual_result, tuple):
+        residual = residual_result[0]
+    else:
+        residual = residual_result
 
     x_flat = x.flatten(1)
     residual = residual.flatten(1)
@@ -205,7 +235,11 @@ class NestedTensorBlock(Block):
         if self.training and self.sample_drop_ratio > 0.0:
 
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.attn(self.norm1(x), attn_bias=attn_bias)
+                if self.output_attn_map:
+                    attn_out, attn_map = self.attn(self.norm1(x), attn_bias=attn_bias)
+                    return attn_out, attn_map
+                else:
+                    return self.attn(self.norm1(x), attn_bias=attn_bias) 
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.mlp(self.norm2(x))
@@ -226,7 +260,11 @@ class NestedTensorBlock(Block):
         else:
 
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
+                if self.output_attn_map:
+                    attn_out, attn_map = self.attn(self.norm1(x), attn_bias=attn_bias)
+                    return self.ls1(attn_out), attn_map
+                else:
+                    return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.ls2(self.mlp(self.norm2(x)))
@@ -243,5 +281,7 @@ class NestedTensorBlock(Block):
             if not XFORMERS_AVAILABLE:
                 raise AssertionError("xFormers is required for using nested tensors")
             return self.forward_nested(x_or_x_list)
+        elif isinstance(x_or_x_list, tuple):
+            return super().forward(x_or_x_list[0])
         else:
-            raise AssertionError
+            raise AssertionError("xFormers is required for using tensors or tuple")

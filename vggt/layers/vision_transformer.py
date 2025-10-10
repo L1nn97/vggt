@@ -261,6 +261,12 @@ class DinoVisionTransformer(nn.Module):
             else:
                 x = blk(x)
 
+        attn_map = None
+        if isinstance(x, tuple):
+            x, attn_map = x
+        else:
+            x = x
+
         x_norm = self.norm(x)
         return {
             "x_norm_clstoken": x_norm[:, 0],
