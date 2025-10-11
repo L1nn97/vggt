@@ -16,9 +16,14 @@ model.load_state_dict(torch.load(_LOCAL_PRETRAINED_PATH))
 model.to(device)
 model.eval()
 # Load and preprocess example images (replace with your own image paths)
-image_names = []
-for i in range(10):
-    image_names += ["/home/rokae/zcl/vggt/examples/kitchen/images/{:02d}.png".format(i)]
+image_names = [
+    "/home/rokae/zcl/vggt/examples/s00646/frame_00000.jpg",
+    "/home/rokae/zcl/vggt/examples/s00646/frame_00382.jpg",
+    "/home/rokae/zcl/vggt/examples/s00646/frame_00508.jpg",
+    "/home/rokae/zcl/vggt/examples/s00646/frame_00470.jpg",
+]
+# for i in range(10):
+    # image_names += ["/home/rokae/zcl/vggt/examples/s00646/frame_{:05d}.png".format(i)]
 
 images = load_and_preprocess_images(image_names).to(device)
 
