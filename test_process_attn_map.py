@@ -92,6 +92,7 @@ if __name__ == '__main__':
         
         heatmap = cv.cvtColor(heatmap, cv.COLOR_GRAY2RGB) if len(heatmap.shape)==2 else heatmap
         heatmap_colored = cv.applyColorMap(np.uint8(255 * heatmap), cv.COLORMAP_JET)
+        heatmap_colored = heatmap_colored[..., [2, 1, 0]]
         
         # 如果图像不是 uint8 类型，进行转换
         if heatmap_colored.dtype != np.uint8:
