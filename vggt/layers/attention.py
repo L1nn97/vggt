@@ -54,11 +54,6 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
-        
-        self.image_names = []
-        for i in range(10):
-            self.image_names += ["/home/rokae/zcl/vggt/examples/kitchen/images/{:02d}.png".format(i)]
-        self.images = load_and_preprocess_images(self.image_names)
     
     def set_use_fused_attn(self, use_fused: bool) -> None:
         print("set_use_fused_attn: ", use_fused)
