@@ -27,6 +27,196 @@ from merging.merge import token_merge_bipartite2d
 
 XFORMERS_AVAILABLE = False
 
+class GlobalAttentionWithTokenMerge(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = True,
+        proj_bias: bool = True,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+        norm_layer: nn.Module = nn.LayerNorm,
+        qk_norm: bool = False,
+        fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
+        output_attn_map: bool = False,
+        token_weighter: TokenFusionStrategy = None,
+        rope=None,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, "dim should be divisible by num_heads"
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim**-0.5
+
+        # for zcl test
+        self.fused_attn = fused_attn
+        self.output_attn_map = output_attn_map
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim, bias=proj_bias)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.rope = rope
+
+        self.ot_params = {
+            'reg':0.1,
+            'reg_kl':10,
+            'sinkhorn_iterations':10,
+            'mass':0.9,
+            'bin_score':0.3
+        }
+        self.matcher = SoftmaxMatcher(**self.ot_params)
+        self.matcher.eval()
+        self.token_weighter = token_weighter
+    
+    def set_use_fused_attn(self, use_fused: bool) -> None:
+        print("set_use_fused_attn: ", use_fused)
+        self.fused_attn = use_fused
+
+    def forward(self, x: Tensor, pos=None, idx=None) -> Tensor:
+
+        # self.token_weighter.calculate_token_cos_similarity(x, idx)
+        # print(f"visualize token similarity heatmap of layer {idx}")
+        # self.token_weighter.visualize_token_similarity_heatmap(x, [1, 2, 3, 4, 931, 932, 933, 934], [0, 1, 2, 3])
+
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k) # (B, num_heads, N, head_dim)
+
+        # q_original = q.clone()
+
+        if self.rope is not None:
+            q = self.rope(q, pos)
+            k = self.rope(k, pos)
+
+        # calculate rope gain
+        # self.token_weighter.calculate_rope_gain(q_original, q)
+        # del q_original
+
+        enable_token_merge = False
+        self.merge_ratio = 0.5
+        self.patch_width = 37
+        self.patch_height = 25
+        if enable_token_merge:
+            generator = torch.Generator(device=x.device)
+            generator.manual_seed(33)
+
+            r = int(x.shape[1] * self.merge_ratio)
+
+            m, u = token_merge_bipartite2d(
+                x,
+                self.patch_width,
+                self.patch_height,
+                5,
+                5,
+                r,
+                no_rand=False, # True: 不在每个网格中随机选取作为dst
+                generator=generator,
+                enable_protection=True,
+            )
+
+            m_a, u_a = (m, u)
+
+            B_q, H_q, N_q, D_q = q.shape
+
+            q_merge_in = q.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q) # (B, N, H * D)
+            k_merge_in = k.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+            v_merge_in = v.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+
+            print(f"q_merge_in.shape: {q_merge_in.shape}")
+            print(f"k_merge_in.shape: {k_merge_in.shape}")
+            print(f"v_merge_in.shape: {v_merge_in.shape}")
+
+            q_out, k_out, v_out = m_a(
+                q_merge_in,
+                mode="mean",
+                extra_tensors=k_merge_in,
+                extra_tensors_2=v_merge_in,
+            )
+
+            print(f"q_out.shape: {q_out.shape}")
+            print(f"k_out.shape: {k_out.shape}")
+            print(f"v_out.shape: {v_out.shape}")
+
+            del q_merge_in, k_merge_in, v_merge_in
+
+            N_m = q_out.shape[1]
+            q = q_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+            k = k_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+            v = v_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+
+            del q_out, k_out, v_out
+
+            N = N_m
+
+            x = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
+            del q, k, v
+
+            x = x.transpose(1, 2).reshape(B, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            x = u_a(x)
+            return x
+        #############################################
+
+        attn_before_softmax = None
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        else:
+            q = q * self.scale
+            attn_before_softmax = q @ k.transpose(-2, -1)
+
+            # # 显示softmax之前的注意力图，用来观察attention collapse现象 (FastVGGT中的显示方式)
+            # display_attn_map_before_softmax = False
+            # if display_attn_map_before_softmax:
+            #     print(f"Display attn map before softmax of layer {idx}")
+            #     self.token_weighter.visualize_attn_map(attn_before_softmax, [0, 500, 930, 1430], [0, 1, 2])
+
+            attn_before_softmax = self.token_weighter.attention_knockout(attn_before_softmax, idx)
+            attn_after_softmax = attn_before_softmax.softmax(dim=-1)
+
+            patch_row, patch_col = 0, 0
+            print(f"idx: {idx}")
+            self.token_weighter.calculate_visible_mask(attn_before_softmax, (patch_row, patch_col), 0, 1)
+
+            # # 显示softmax之后的注意力图，更容易观察到注意力中的匹配现象
+            # display_attn_map_after_softmax = False
+            # if display_attn_map_after_softmax:
+            #     print(f"Display attn map after softmax of layer {idx}")
+            #     self.token_weighter.visualize_attn_map(attn_after_softmax, [0, 1, 2, 3, 4], [0, 1, 2, 3])
+            #     self.token_weighter.visualize_attn_map(attn_after_softmax, [500, 800], [0, 1, 2, 3])
+
+            # # 计算after softmax 之后的 top-k dominance 达到百分之90的token比例
+            # calculate_top_k_dominance = False
+            # if calculate_top_k_dominance:
+            #     k_mean, k_per_query = self.token_weighter.calculate_top_k_dominance(attn_after_softmax)
+            #     print(f"k_mean: {k_mean}")
+            #     del k_mean, k_per_query
+
+            attn = self.attn_drop(attn_after_softmax)
+            x = attn @ v
+        
+        x = x.transpose(1, 2).reshape(B, N, C) 
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+
+        if self.output_attn_map:
+            return x, attn_before_softmax
+        else:
+            return x
+
+
+
 class GlobalAttention(nn.Module):
     def __init__(
         self,
@@ -112,6 +302,10 @@ class GlobalAttention(nn.Module):
 
             attn_before_softmax = self.token_weighter.attention_knockout(attn_before_softmax, idx)
             attn_after_softmax = attn_before_softmax.softmax(dim=-1)
+
+            patch_row, patch_col = 0, 0
+            print(f"idx: {idx}")
+            self.token_weighter.calculate_visible_mask(attn_before_softmax, (patch_row, patch_col), 0, 1)
 
             # # 显示softmax之后的注意力图，更容易观察到注意力中的匹配现象
             # display_attn_map_after_softmax = False

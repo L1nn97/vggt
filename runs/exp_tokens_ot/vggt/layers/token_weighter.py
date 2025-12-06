@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import cv2
-from typing import Tuple
+from typing import Any, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -366,6 +366,85 @@ class TokenFusionStrategy:
         plt.colorbar()
         plt.show()
         return target_attn_maps
+
+    def calculate_visible_mask(self, attn_map: Tensor, src_patch_idx: Tuple[int, int], src_view_idx: int, tgt_view_idx: int) -> np.ndarray:
+        image_0, depth_0, mask_0, world_coords_0, intrinsic_0, extrinsic_0 = self.images[src_view_idx], self.depths[src_view_idx], self.masks[src_view_idx], self.world_coords[src_view_idx], self.intrinsics[src_view_idx], self.extrinsics[src_view_idx]
+        image_1, depth_1, mask_1, world_coords_1, intrinsic_1, extrinsic_1 = self.images[tgt_view_idx], self.depths[tgt_view_idx], self.masks[tgt_view_idx], self.world_coords[tgt_view_idx], self.intrinsics[tgt_view_idx], self.extrinsics[tgt_view_idx]
+
+        patch_row, patch_col = src_patch_idx
+
+        num_row_patch, num_col_patch = 25, 37
+
+        row_idx = np.arange(patch_row * 14, (patch_row + num_row_patch) * 14)
+        col_idx = np.arange(patch_col * 14, (patch_col + num_col_patch) * 14)
+
+        xx, yy = np.meshgrid(col_idx, row_idx)
+        src_pnts_uv = np.stack([xx, yy], axis=-1)
+
+        src_image_crop = image_0[src_pnts_uv[..., 1], src_pnts_uv[..., 0]]
+        world_coords_crop = world_coords_0[src_pnts_uv[..., 1], src_pnts_uv[..., 0]]
+        reproj_uv_crop = reproj_world_coords_to_image(world_coords_crop, intrinsic_1, extrinsic_1)
+        reproj_uv_crop_int = reproj_uv_crop.astype(np.int32)
+
+        valid_mask = (
+            (reproj_uv_crop_int[..., 0] >= 0) & (reproj_uv_crop_int[..., 0] < image_1.shape[1]) &
+            (reproj_uv_crop_int[..., 1] >= 0) & (reproj_uv_crop_int[..., 1] < image_1.shape[0])
+        ).astype(np.float32)
+
+        # print(f"reproj_uv_crop: {reproj_uv_crop_int}")
+
+        # print(f"valid_mask.shape: {valid_mask.shape}")
+
+        # points_1_on_image_0_coordinates = world_coords_1 @ extrinsic_0[:3, :3].T + extrinsic_0[:3, 3]
+        # depth_1_on_image_0_coordinates = np.zeros_like(depth_0)
+
+        u = reproj_uv_crop_int[..., 0]
+        v = reproj_uv_crop_int[..., 1]
+        mask_valid = valid_mask > 0
+
+        patch_idx = (v[mask_valid] // self.patch_size, u[mask_valid] // self.patch_size)
+
+        attn_map_col_idx = tgt_view_idx * 930 + 5 + patch_idx[0] * 14 + patch_idx[1]
+        attn_map_row_idx = np.ones_like(attn_map_col_idx) * (src_view_idx * 930 + 5 + patch_row * 14 + patch_col)
+
+        attn_map_row_idx = attn_map_row_idx.astype(np.int32).reshape(-1)
+        attn_map_col_idx = attn_map_col_idx.astype(np.int32).reshape(-1)
+
+        points = world_coords_0[src_pnts_uv[..., 1][mask_valid], src_pnts_uv[..., 0][mask_valid]]
+        # points 形状可能是 (H, W, 3)，这里统一展平为 (N, 3)
+        points = points.reshape(-1, 3)
+
+        # gray ∈ [0, 1]，根据 gray 的值使用 jet colormap 映射到 RGB：
+        # 0 → 蓝色，1 → 红色，中间值为绿色/黄色等
+        gray = attn_map[:, :, attn_map_row_idx, attn_map_col_idx].mean(dim=0).cpu().numpy()
+        gray = gray.reshape(-1)                      # (N,)
+        gray = np.clip(gray, 0.0, 1.0)               # 保证在 [0, 1]
+
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+
+        cmap = plt.cm.get_cmap('jet')
+        colors = cmap(gray)[:, :3]                   # (N, 4) → (N, 3)，丢弃 alpha
+        colors = colors.astype(np.float32)
+
+        # 保证颜色和点的数量一致（一般应当相同，只是这里做个安全裁剪）
+        n = min(points.shape[0], colors.shape[0])
+        colors = colors[:n]
+        points = points[:n]
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        o3d.visualization.draw_geometries([pcd])
+        plt.show()
+
+
+
+        # reproj_mask = np.zeros_like(image_1)
+        # reproj_mask[v[mask_valid], u[mask_valid]] = 255
+        # plt.imshow(reproj_mask)
+        # plt.show()
+
 
     def calculate_visible_score(self, src_view_idx: int, tgt_view_idx: int) -> np.ndarray:
         image_0, depth_0, mask_0, world_coords_0, intrinsic_0, extrinsic_0 = self.images[src_view_idx], self.depths[src_view_idx], self.masks[src_view_idx], self.world_coords[src_view_idx], self.intrinsics[src_view_idx], self.extrinsics[src_view_idx]

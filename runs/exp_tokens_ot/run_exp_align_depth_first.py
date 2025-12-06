@@ -500,7 +500,7 @@ def get_example_images(path: str, num_images: int = 3, device: str = "cuda") -> 
 if __name__ == "__main__":
     cfg = VGGTReconstructConfig(
         scan_id=1,
-        num_images=4,
+        num_images=8,
         save_attn_map=False,
         save_results=False,
         use_local_display=True

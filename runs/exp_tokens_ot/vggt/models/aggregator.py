@@ -13,7 +13,7 @@ from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple, Union, List, Dict, Any
 
 from vggt.layers import PatchEmbed
-from vggt.layers.attention import GlobalAttention, Attention
+from vggt.layers.attention import GlobalAttention, Attention, GlobalAttentionWithTokenMerge
 from vggt.layers.block import Block, GlobalAttnBlock
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
@@ -118,7 +118,7 @@ class Aggregator(nn.Module):
                     output_attn_map = True,
                     rope=self.rope,
                     qk_norm=qk_norm,
-                    attn_class=GlobalAttention,
+                    attn_class=GlobalAttentionWithTokenMerge,
                     token_weighter=token_weighter,
                 )
                 for _ in range(depth)
