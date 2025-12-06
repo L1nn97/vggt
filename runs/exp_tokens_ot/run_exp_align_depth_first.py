@@ -14,20 +14,15 @@ import matplotlib.pyplot as plt
 np.set_printoptions(threshold = np.inf) 
 np.set_printoptions(suppress = True)
 
-# current_work_dir = os.getcwd()
-# sys.path += [
-#     os.path.join(current_work_dir, "vggt"),
-#     os.path.join(current_work_dir, "spann3r")
-# ]
-
 from data.dtu_loader import DTUScanLoader
 from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.layers.token_weighter import TokenFusionStrategy
+from vggt.layers.token_weighter import TokenFusionStrategy, TokenFusionStrategyConfig
 from eval.criterion import Regr3D_t_ScaleShiftInv, L21
 from vggt.utils.geometry import depth_to_world_coords_points, depth_to_cam_coords_points
 from evaluation.depth_estimation import calculate_depth_error, align_pred_to_gt
+from evaluation.pose_estimation import compute_pairwise_relative_errors, convert_poses_to_4x4
 
 
 def calc_aligned_depth(
@@ -36,6 +31,7 @@ def calc_aligned_depth(
     gt_mask: np.ndarray,
     use_local_display: bool = True,
     verbose: bool = False,
+    max_depth_diff: float = 50.0,
 ):
     """
     对齐预测深度与GT深度，计算误差统计，并可视化结果。
@@ -95,14 +91,14 @@ def calc_aligned_depth(
 
     # 计算差值（绝对值误差）
     depth_diff = np.abs(gt_depth_view - aligned_pred_depth)
-    # 只考虑mask有效区域
-    valid_mask = gt_mask_view.astype(bool)
+    # 截断diff>max_depth_diff的值（视为异常值）
+    diff_mask = depth_diff <= max_depth_diff
+    # 只考虑mask有效区域，并且diff<=max_depth_diff
+    valid_mask = gt_mask_view.astype(bool) & diff_mask
     depth_diff_masked = np.where(valid_mask, depth_diff, np.nan)
 
     # 计算差值的统计数据
     valid_diff = depth_diff[valid_mask] if np.any(valid_mask) else np.array([])
-
-    
     
     # 构建统计信息字典
     stats_dict = {}
@@ -432,47 +428,40 @@ class VGGTReconstructConfig:
     )
     checkpoint_path: str = "/home/vision/ws/vggt/checkpoints/model.pt"
 
-    dtu_root: str = "/home/vision/ws/datasets/SampleSet/dtu_mvs"
-    target_size: Tuple[int, int] = (518, 350)
-
     output_dir: str = (
         "/home/vision/ws/vggt/runs/exp_tokens_ot/results/depth_estimation/"
     )
-    attn_map_save_dir: str = os.path.join(output_dir, "attention_maps")
 
+    # 模型相关配置
+    patch_size: int = 14
+    special_tokens_num: int = 5
+
+    # dtu 数据集相关配置
+    dtu_root: str = "/home/vision/ws/datasets/SampleSet/dtu_mvs"
+    target_size: Tuple[int, int] = (518, 350)
     scan_id: int = 1
-    num_images: int = 4
+    num_views: int = 4
+    view_step: int = 1
 
     # 置信度过滤配置（对最终导出的点云生效）
-    # 是否根据置信度过滤点云
+    # 是否根据置信度过滤点云， 百分位阈值（0~100），例如 50.0 表示保留大于等于中位数置信度的点
     use_conf_filter: bool = False
-
-    # 百分位阈值（0~100），例如 50.0 表示保留大于等于中位数置信度的点
     conf_percentile: float = 30.0
+
+    # 深度误差截断配置
+    # 深度差值超过此阈值的点将被视为异常值并排除在统计之外
+    max_depth_diff: float = 50.0
 
     # use local display
     use_local_display: bool = False
 
-    # save attn map
-    save_attn_map: bool = False
-
     # save results
     save_results: bool = False
 
-
-@dataclass
-class TokenFusionStrategyConfig:
-    dtu_mvs_root: str = "/home/vision/ws/datasets/SampleSet/dtu_mvs"
-    scan_id: int = 1
-    num_views: int = 4
-    step: int = 1
-    device: str = "cpu"
-    target_size: Tuple[int, int] = (518, 350)
-    patch_size: int = 14
-    special_tokens_num: int = 5
-    knockout_layer_idx: list[int] = field(default_factory=lambda: [-1])
-    knockout_method: str = "random" # "random" or "visible_score" or "top_k"
-    knockout_random_ratio: float = 0.5
+    # knockout 配置
+    knockout_layer_idx: List[int] = field(default_factory=lambda: [])
+    knockout_method: str = "top_k"  # "random" or "visible_score" or "top_k"
+    knockout_random_ratio: float = 0.1
     knockout_top_k: int = 100
 
 #这一段代码是为了获取示例图像，用于测试###################################################
@@ -498,23 +487,43 @@ def get_example_images(path: str, num_images: int = 3, device: str = "cuda") -> 
 ###################################################################################
 
 if __name__ == "__main__":
+
     cfg = VGGTReconstructConfig(
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16,
+        checkpoint_path="/home/vision/ws/vggt/checkpoints/model.pt",
+        output_dir="/home/vision/ws/vggt/runs/exp_tokens_ot/results/depth_estimation/",
+        patch_size=14,
+        special_tokens_num=5,
+        dtu_root="/home/vision/ws/datasets/SampleSet/dtu_mvs",
+        target_size=(518, 350),
         scan_id=1,
-        num_images=8,
-        save_attn_map=False,
+        num_views=4,
+        view_step=1,
+        use_conf_filter=False,
+        conf_percentile=30.0,
+        max_depth_diff=50.0,
+        use_local_display=True,
         save_results=False,
-        use_local_display=True
+        knockout_layer_idx=[-1],
+        knockout_method="top_k",
+        knockout_random_ratio=0.5,
+        knockout_top_k=100
     )
 
     token_fusion_strategy_cfg = TokenFusionStrategyConfig(
         dtu_mvs_root=cfg.dtu_root,
         scan_id=cfg.scan_id,
-        num_views=cfg.num_images,
-        step=1,
-        knockout_layer_idx=[],
-        knockout_method="top_k",
-        knockout_random_ratio=0.1,
-        knockout_top_k=100,
+        num_views=cfg.num_views,
+        step=cfg.view_step,
+        device=cfg.device,
+        target_size=cfg.target_size,
+        patch_size=cfg.patch_size,
+        special_tokens_num=cfg.special_tokens_num,
+        knockout_layer_idx=cfg.knockout_layer_idx,
+        knockout_method=cfg.knockout_method,
+        knockout_random_ratio=cfg.knockout_random_ratio,
+        knockout_top_k=cfg.knockout_top_k,
     )
 
     token_weighter = TokenFusionStrategy(token_fusion_strategy_cfg)
@@ -524,15 +533,11 @@ if __name__ == "__main__":
     base_output_dir = cfg.output_dir.rstrip("/")
     save_root = f"{base_output_dir}_{timestamp}/"
 
-    if cfg.save_results or cfg.save_attn_map:
+    if cfg.save_results:
         os.makedirs(save_root, exist_ok=True)
         print(f"Create output directory: {save_root}")
 
-    attn_map_save_dir = (
-        os.path.join(save_root, "attention_maps") if cfg.save_attn_map else None
-    )
-
-    model = VGGT(attn_map_save_dir=attn_map_save_dir, token_weighter=token_weighter)
+    model = VGGT(token_weighter=token_weighter)
     model.load_state_dict(torch.load(cfg.checkpoint_path))
     model.to(cfg.device)
     model.eval()
@@ -541,8 +546,8 @@ if __name__ == "__main__":
     loader = DTUScanLoader(
         cfg.dtu_root,
         scan_id=cfg.scan_id,
-        num_views=cfg.num_images,
-        step=1,
+        num_views=cfg.num_views,
+        step=cfg.view_step,
         device=cfg.device,
         target_size=cfg.target_size,
     )
@@ -561,54 +566,55 @@ if __name__ == "__main__":
         with torch.amp.autocast('cuda',dtype=cfg.dtype):
             predictions = model(gt_images)
 
-    if len(token_weighter.tokens_erank_kernel_norm)> 0:
-        plt.figure()
-        plt.plot(token_weighter.tokens_erank_kernel_norm, marker='o')
-        plt.title(f"tokens erank kernel norm Over Layers")
-        plt.xlabel("Layer Index")
-        plt.ylabel("tokens erank kernel norm")
-        plt.grid(True)
-        plt.show()
-    
-    if len(token_weighter.tokens_erank_fro_norm) > 0:
-        plt.figure()
-        plt.plot(token_weighter.tokens_erank_fro_norm, marker='x')
-        plt.title(f"tokens erank fro norm Over Layers")
-        plt.xlabel("Layer Index")
-        plt.ylabel("tokens erank fro norm")
-        plt.grid(True)
-        plt.show()
+    if cfg.use_local_display:
+        if len(token_weighter.tokens_erank_kernel_norm)> 0:
+            plt.figure()
+            plt.plot(token_weighter.tokens_erank_kernel_norm, marker='o')
+            plt.title(f"tokens erank kernel norm Over Layers")
+            plt.xlabel("Layer Index")
+            plt.ylabel("tokens erank kernel norm")
+            plt.grid(True)
+            plt.show()
+        
+        if len(token_weighter.tokens_erank_fro_norm) > 0:
+            plt.figure()
+            plt.plot(token_weighter.tokens_erank_fro_norm, marker='x')
+            plt.title(f"tokens erank fro norm Over Layers")
+            plt.xlabel("Layer Index")
+            plt.ylabel("tokens erank fro norm")
+            plt.grid(True)
+            plt.show()
 
-    if len(token_weighter.q_rope_gain) > 0 or len(token_weighter.top_k_dominance) > 0:
-        plt.figure()
-        if len(token_weighter.q_rope_gain) > 0:
-            plt.plot(token_weighter.q_rope_gain, marker='o')
+        if len(token_weighter.q_rope_gain) > 0 or len(token_weighter.top_k_dominance) > 0:
+            plt.figure()
+            if len(token_weighter.q_rope_gain) > 0:
+                plt.plot(token_weighter.q_rope_gain, marker='o')
+            if len(token_weighter.top_k_dominance) > 0:
+                plt.plot(token_weighter.top_k_dominance, marker='x')
+            plt.title(f"rope gain and top-k dominance Over Layers")
+            plt.xlabel("Layer Index")
+            plt.ylabel("ratio(rope gain / q_original & top-k num / num_keys)")
+            plt.grid(True)
+            plt.show()
+    
         if len(token_weighter.top_k_dominance) > 0:
-            plt.plot(token_weighter.top_k_dominance, marker='x')
-        plt.title(f"rope gain and top-k dominance Over Layers")
-        plt.xlabel("Layer Index")
-        plt.ylabel("ratio(rope gain / q_original & top-k num / num_keys)")
-        plt.grid(True)
-        plt.show()
-    
-    if len(token_weighter.top_k_dominance) > 0:
-        plt.figure()
-        layer_indices = range(len(token_weighter.top_k_dominance))
-        plt.bar(layer_indices, token_weighter.top_k_dominance)
-        plt.title(f"top-k dominance Over Layers")
-        plt.xlabel("Layer Index")
-        plt.ylabel("top-k dominance")
-        plt.grid(True, axis='y')
-        plt.show()
+            plt.figure()
+            layer_indices = range(len(token_weighter.top_k_dominance))
+            plt.bar(layer_indices, token_weighter.top_k_dominance)
+            plt.title(f"top-k dominance Over Layers")
+            plt.xlabel("Layer Index")
+            plt.ylabel("top-k dominance")
+            plt.grid(True, axis='y')
+            plt.show()
 
-    if len(token_weighter.x_cos_similarity) > 0:
-        plt.figure()
-        plt.plot(token_weighter.x_cos_similarity, marker='o')
-        plt.title(f"token cos similarity Over Layers")
-        plt.xlabel("Layer Index")
-        plt.ylabel("token cos similarity")
-        plt.grid(True)
-        plt.show()
+        if len(token_weighter.x_cos_similarity) > 0:
+            plt.figure()
+            plt.plot(token_weighter.x_cos_similarity, marker='o')
+            plt.title(f"token cos similarity Over Layers")
+            plt.xlabel("Layer Index")
+            plt.ylabel("token cos similarity")
+            plt.grid(True)
+            plt.show()
 
 
     # gt_images: [S, 3, H, W]，VGGT 内部会加 batch 维度 => pose_enc: [B, S, 9]
@@ -637,22 +643,92 @@ if __name__ == "__main__":
             gt_mask=gt_masks[i],
             use_local_display=False,
             verbose=False,
+            max_depth_diff=cfg.max_depth_diff,
         )
         aligned_pred_depths.append(aligned_pred_depth)
         shifts.append(shift)
         scales.append(scale)
         stats_list.append(stats_dict)
-        print(f"mean depth error: {stats_dict['mean']:.6f}")
+        # print(f"mean depth error: {stats_dict['mean']:.6f}")
         # rescale extrinsic and intrinsic
         pred_extrinsic[i][:, 3] = pred_extrinsic[i][:, 3] * scale 
     
-    mean_depth_error = np.mean([stats_dict['mean'] for stats_dict in stats_list])
-    print(f"mean depth error: {mean_depth_error:.6f}")
+    # 计算各视图的平均统计值
+    total_valid_pixels = sum([s['valid_pixels'] for s in stats_list])
+    total_pixels = sum([s['total_pixels'] for s in stats_list])
+    
+    # 计算加权平均（按有效像素数加权）
+    valid_stats_list = [s for s in stats_list if not np.isnan(s['mean']) and s['valid_pixels'] > 0]
+    
+    # 加权平均（按有效像素数）
+    weights = np.array([s['valid_pixels'] for s in valid_stats_list])
+    weights = weights / weights.sum()
+    
+    weighted_stats = {
+        "mean": np.average([s['mean'] for s in valid_stats_list], weights=weights),
+        "std": np.average([s['std'] for s in valid_stats_list], weights=weights),
+        "median": np.average([s['median'] for s in valid_stats_list], weights=weights),
+        "min": np.min([s['min'] for s in valid_stats_list]),
+        "max": np.max([s['max'] for s in valid_stats_list]),
+        "q25": np.average([s['q25'] for s in valid_stats_list], weights=weights),
+        "q75": np.average([s['q75'] for s in valid_stats_list], weights=weights),
+        "q95": np.average([s['q95'] for s in valid_stats_list], weights=weights),
+        "q99": np.average([s['q99'] for s in valid_stats_list], weights=weights),
+    }   
+    
+    # 打印加权平均统计（按有效像素数加权）
+    print("\n加权平均统计 (按有效像素数加权):")
+    print(f"  均值 (Mean):           {weighted_stats['mean']:.6f}")
+    print(f"  标准差 (Std):          {weighted_stats['std']:.6f}")
+    print(f"  中位数 (Median):       {weighted_stats['median']:.6f}")
+    print(f"  最小值 (Min):          {weighted_stats['min']:.6f}")
+    print(f"  最大值 (Max):          {weighted_stats['max']:.6f}")
+    print(f"  25%分位数 (Q25):       {weighted_stats['q25']:.6f}")
+    print(f"  75%分位数 (Q75):       {weighted_stats['q75']:.6f}")
+    print(f"  95%分位数 (Q95):       {weighted_stats['q95']:.6f}")
+    print(f"  99%分位数 (Q99):       {weighted_stats['q99']:.6f}")
+    print(f"  有效像素比例:          {total_valid_pixels / total_pixels * 100.0:.2f}%")
+    
+    # 打印每个视图的简要信息
+    print("\n各视图详细统计:")
+    for i, stats_dict in enumerate(stats_list):
+        if not np.isnan(stats_dict['mean']):
+            print(f"  视图 {i}: 均值={stats_dict['mean']:.6f}, "
+                  f"中位数={stats_dict['median']:.6f}, "
+                  f"有效像素={stats_dict['valid_pixels']} ({stats_dict['valid_ratio']:.2f}%)")
+        else:
+            print(f"  视图 {i}: 无有效数据")
+    
+    
+    # 确保位姿格式一致（转换为 4x4 格式）
+    pred_poses_4x4 = convert_poses_to_4x4(pred_extrinsic)
+    gt_poses_4x4 = convert_poses_to_4x4(gt_extrinsics)
+    
+    pairwise_metrics = compute_pairwise_relative_errors(
+        poses_pred=pred_poses_4x4,
+        poses_gt=gt_poses_4x4,
+        verbose=True,
+    )
+    
+    # 保存位姿误差结果
+    if cfg.save_results:
+        pose_error_path = os.path.join(save_root, "pose_error_metrics.json")
+        import json
+        # 将numpy数组转换为列表以便JSON序列化
+        pose_metrics_dict = {
+            "rra_error_mean": float(np.mean(pairwise_metrics["rra"])),
+            "rra_error_std": float(np.std(pairwise_metrics["rra"])),
+            "rra_error_median": float(np.median(pairwise_metrics["rra"])),
+            "rta_error_mean": float(np.mean(pairwise_metrics["rta"])),
+            "rta_error_std": float(np.std(pairwise_metrics["rta"])),
+            "rta_error_median": float(np.median(pairwise_metrics["rta"])),
+        }
+        with open(pose_error_path, 'w') as f:
+            json.dump(pairwise_metrics, f, indent=2)
+        print(f"\n位姿误差指标已保存到: {pose_error_path}")
 
-    # print(f"pred_extrinsic[0]: \n{pred_extrinsic[0]}")
-    # print(f"gt_extrinsics[0]: \n{gt_extrinsics[0]}")
-    # print(f"pred_intrinsic[0]: \n{pred_intrinsic[0]}")
-    # print(f"gt_intrinsics[0]: \n{gt_intrinsics[0]}")
+    # if cfg.save_results:
+    #     save_depth_estimation_results(aligned_pred_depths, pred_extrinsic, pred_intrinsic, gt_depths, gt_masks, stats_list, save_root)
 
     aligned_pred_depths = np.array(aligned_pred_depths)
 

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
 
 from data.dtu_loader import DTUScanLoader
 from vggt.utils.geometry import depth_to_world_coords_points
@@ -110,29 +111,6 @@ def reproj_world_coords_to_image(world_coords_src: np.ndarray, intrinsic_tgt: np
     reproj_uv = reproj_uv[0].reshape(world_coords_src.shape[0], world_coords_src.shape[1], 2)  # (H, W, 2)
     return reproj_uv
 
-"""
-    token_weighter_args_example = {
-        "dtu_mvs_root": cfg.dtu_root,
-        "scan_id": cfg.scan_id,
-        "num_views": cfg.num_images,
-        "step": 1,
-        "device": 'cpu',
-        "target_size": (518, 350),
-        "patch_size": 14,
-        "special_tokens_num": 5,
-
-
-        # for attention knockout
-        "knockout_layer_idx": ['all'],
-        "knockout_method":"random",
-        # for random knockout
-        "knockout_random_ratio": 0.5,
-        # for visible score knockout nothing to do
-        # for top-k preserved knockout      
-        "knockout_top_k": 100,
-    }
-"""
-
 def apply_heatmap(image, heatmap, alpha=0.4):
     """
     :param image: 原始图像，shape (H, W, 3)
@@ -161,6 +139,20 @@ def apply_heatmap(image, heatmap, alpha=0.4):
     output = cv2.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
     return output
         
+@dataclass
+class TokenFusionStrategyConfig:
+    dtu_mvs_root: str = "placeholder"
+    scan_id: int = 1
+    num_views: int = 1
+    step: int = 1
+    device: str = "cpu"
+    target_size: Tuple[int, int] = (518, 350)
+    patch_size: int = 14
+    special_tokens_num: int = 5
+    knockout_layer_idx: list[int] = field(default_factory=lambda: [-1])
+    knockout_method: str = "random" # "random" or "visible_score" or "top_k"
+    knockout_random_ratio: float = 0.5
+    knockout_top_k: int = 100
 
 class TokenFusionStrategy:
     def __init__(self, args):
@@ -444,7 +436,6 @@ class TokenFusionStrategy:
         # reproj_mask[v[mask_valid], u[mask_valid]] = 255
         # plt.imshow(reproj_mask)
         # plt.show()
-
 
     def calculate_visible_score(self, src_view_idx: int, tgt_view_idx: int) -> np.ndarray:
         image_0, depth_0, mask_0, world_coords_0, intrinsic_0, extrinsic_0 = self.images[src_view_idx], self.depths[src_view_idx], self.masks[src_view_idx], self.world_coords[src_view_idx], self.intrinsics[src_view_idx], self.extrinsics[src_view_idx]

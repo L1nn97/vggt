@@ -71,7 +71,6 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
-        attn_map_save_dir=None,
         token_weighter=None,
     ):
         super().__init__()
@@ -82,8 +81,6 @@ class Aggregator(nn.Module):
         self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
         self.position_getter = PositionGetter() if self.rope is not None else None
 
-        # for zcl test
-        self.attn_map_save_dir = attn_map_save_dir
 
         self.frame_blocks = nn.ModuleList(
             [
@@ -97,7 +94,6 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     fused_attn=False,
-                    output_attn_map = True,
                     rope=self.rope,
                 )
                 for _ in range(depth)
@@ -115,7 +111,6 @@ class Aggregator(nn.Module):
                     ffn_bias=ffn_bias,
                     init_values=init_values,
                     fused_attn=False,  # disable fused_attn when saving attn map
-                    output_attn_map = True,
                     rope=self.rope,
                     qk_norm=qk_norm,
                     attn_class=GlobalAttentionWithTokenMerge,
@@ -252,27 +247,15 @@ class Aggregator(nn.Module):
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
-                    tokens, frame_idx, frame_intermediates, intermediates_attn_maps = self._process_frame_attention(
+                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
-                    if self.attn_map_save_dir:
-                        save_path = os.path.join(self.attn_map_save_dir, f"frame_attn_map_{frame_idx}.pt")
-                        attn_map_to_save = intermediates_attn_maps[0].detach().cpu().clone()
-                        torch.save(attn_map_to_save, save_path)
-                        del attn_map_to_save
-                        torch.cuda.empty_cache()
                         
 
                 elif attn_type == "global":
-                    tokens, global_idx, global_intermediates, intermediates_attn_maps = self._process_global_attention(
+                    tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos
                     )
-                    if self.attn_map_save_dir:
-                        save_path = os.path.join(self.attn_map_save_dir, f"global_attn_map_{frame_idx}.pt")
-                        attn_map_to_save = intermediates_attn_maps[0].detach().cpu().clone()
-                        torch.save(attn_map_to_save, save_path)
-                        del attn_map_to_save
-                        torch.cuda.empty_cache()  # optional，每次大量保存后清理
 
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -299,20 +282,17 @@ class Aggregator(nn.Module):
             pos = pos.view(B, S, P, 2).view(B * S, P, 2)
 
         intermediates = []
-        intermediates_attn_maps = []
-        attn_maps = None
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens, attn_maps = self.frame_blocks[frame_idx](tokens, pos=pos)
+                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
-            intermediates_attn_maps.append(attn_maps)
 
-        return tokens, frame_idx, intermediates, intermediates_attn_maps
+        return tokens, frame_idx, intermediates
 
     def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
         """
@@ -325,19 +305,16 @@ class Aggregator(nn.Module):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
         intermediates = []
-        intermediates_attn_maps = []
-        attn_maps = None
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens, attn_maps = self.global_blocks[global_idx](tokens, pos=pos, idx=global_idx)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, idx=global_idx)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
-            intermediates_attn_maps.append(attn_maps)
 
-        return tokens, global_idx, intermediates, intermediates_attn_maps
+        return tokens, global_idx, intermediates
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

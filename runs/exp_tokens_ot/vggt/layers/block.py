@@ -42,14 +42,12 @@ class GlobalAttnBlock(nn.Module):
         ffn_layer: Callable[..., nn.Module] = Mlp,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
-        output_attn_map: bool = False,
         rope=None,
         token_weighter: TokenFusionStrategy = None,
     ) -> None:
         super().__init__()
 
         self.norm1 = norm_layer(dim)
-        self.output_attn_map = output_attn_map
 
         self.attn = attn_class(
             dim,
@@ -60,7 +58,6 @@ class GlobalAttnBlock(nn.Module):
             proj_drop=drop,
             qk_norm=qk_norm,
             fused_attn=fused_attn,
-            output_attn_map=self.output_attn_map,
             rope=rope,
             token_weighter=token_weighter,
         )
@@ -118,10 +115,7 @@ class GlobalAttnBlock(nn.Module):
             x = x + residual
             x = x + ffn_residual_func(x)
 
-        if self.output_attn_map:
-            return x, attn_map
-        else:
-            return x
+        return x
 
 
 class Block(nn.Module):
@@ -143,13 +137,11 @@ class Block(nn.Module):
         ffn_layer: Callable[..., nn.Module] = Mlp,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
-        output_attn_map: bool = False,
         rope=None,
     ) -> None:
         super().__init__()
 
         self.norm1 = norm_layer(dim)
-        self.output_attn_map = output_attn_map
 
         self.attn = attn_class(
             dim,
@@ -160,7 +152,6 @@ class Block(nn.Module):
             proj_drop=drop,
             qk_norm=qk_norm,
             fused_attn=fused_attn,
-            output_attn_map=self.output_attn_map,
             rope=rope,
         )
 
@@ -217,10 +208,7 @@ class Block(nn.Module):
             x = x + residual
             x = x + ffn_residual_func(x)
 
-        if self.output_attn_map:
-            return x, attn_map
-        else:
-            return x
+        return x
 
 
 def drop_add_residual_stochastic_depth(
@@ -335,11 +323,7 @@ class NestedTensorBlock(Block):
         if self.training and self.sample_drop_ratio > 0.0:
 
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                if self.output_attn_map:
-                    attn_out, attn_map = self.attn(self.norm1(x), attn_bias=attn_bias)
-                    return attn_out, attn_map
-                else:
-                    return self.attn(self.norm1(x), attn_bias=attn_bias) 
+                return self.attn(self.norm1(x), attn_bias=attn_bias) 
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.mlp(self.norm2(x))
@@ -360,11 +344,7 @@ class NestedTensorBlock(Block):
         else:
 
             def attn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
-                if self.output_attn_map:
-                    attn_out, attn_map = self.attn(self.norm1(x), attn_bias=attn_bias)
-                    return self.ls1(attn_out), attn_map
-                else:
-                    return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
+                return self.ls1(self.attn(self.norm1(x), attn_bias=attn_bias))
 
             def ffn_residual_func(x: Tensor, attn_bias=None) -> Tensor:
                 return self.ls2(self.mlp(self.norm2(x)))

@@ -39,7 +39,6 @@ class GlobalAttentionWithTokenMerge(nn.Module):
         norm_layer: nn.Module = nn.LayerNorm,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
-        output_attn_map: bool = False,
         token_weighter: TokenFusionStrategy = None,
         rope=None,
     ) -> None:
@@ -51,7 +50,6 @@ class GlobalAttentionWithTokenMerge(nn.Module):
 
         # for zcl test
         self.fused_attn = fused_attn
-        self.output_attn_map = output_attn_map
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -186,7 +184,7 @@ class GlobalAttentionWithTokenMerge(nn.Module):
 
             patch_row, patch_col = 0, 0
             print(f"idx: {idx}")
-            self.token_weighter.calculate_visible_mask(attn_before_softmax, (patch_row, patch_col), 0, 1)
+            # self.token_weighter.calculate_visible_mask(attn_before_softmax, (patch_row, patch_col), 0, 1)
 
             # # 显示softmax之后的注意力图，更容易观察到注意力中的匹配现象
             # display_attn_map_after_softmax = False
@@ -210,10 +208,7 @@ class GlobalAttentionWithTokenMerge(nn.Module):
         x = self.proj_drop(x)
 
 
-        if self.output_attn_map:
-            return x, attn_before_softmax
-        else:
-            return x
+        return x
 
 
 
@@ -229,7 +224,6 @@ class GlobalAttention(nn.Module):
         norm_layer: nn.Module = nn.LayerNorm,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
-        output_attn_map: bool = False,
         token_weighter: TokenFusionStrategy = None,
         rope=None,
     ) -> None:
@@ -241,7 +235,6 @@ class GlobalAttention(nn.Module):
 
         # for zcl test
         self.fused_attn = fused_attn
-        self.output_attn_map = output_attn_map
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -329,10 +322,7 @@ class GlobalAttention(nn.Module):
         x = self.proj_drop(x)
 
 
-        if self.output_attn_map:
-            return x, attn_before_softmax
-        else:
-            return x
+        return x
 
 
 class Attention(nn.Module):
@@ -347,7 +337,6 @@ class Attention(nn.Module):
         norm_layer: nn.Module = nn.LayerNorm,
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
-        output_attn_map: bool = False,
         rope=None,
     ) -> None:
         super().__init__()
@@ -358,7 +347,6 @@ class Attention(nn.Module):
 
         # for zcl test
         self.fused_attn = fused_attn
-        self.output_attn_map = output_attn_map
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -397,10 +385,7 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        if self.output_attn_map:
-            return x, attn_before_softmax
-        else:
-            return x
+        return x
 
 
 class MemEffAttention(Attention):
