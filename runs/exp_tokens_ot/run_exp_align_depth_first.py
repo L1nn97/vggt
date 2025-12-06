@@ -23,6 +23,7 @@ from eval.criterion import Regr3D_t_ScaleShiftInv, L21
 from vggt.utils.geometry import depth_to_world_coords_points, depth_to_cam_coords_points
 from evaluation.depth_estimation import calculate_depth_error, align_pred_to_gt
 from evaluation.pose_estimation import compute_pairwise_relative_errors, convert_poses_to_4x4
+import json
 
 
 def calc_aligned_depth(
@@ -285,59 +286,99 @@ def save_point_cloud_to_ply(points: np.ndarray, colors: np.ndarray, ply_path: st
     print(f"PLY point cloud saved to {ply_path}")
 
 
-def save_alignment_stats_to_json(
-    shifts: List[float], 
-    scales: List[float], 
-    stats_list: List[Dict[str, Any]], 
-    json_path: str
+def save_evaluation_metrics(
+    weighted_stats: Dict[str, float],
+    stats_list: List[Dict[str, Any]],
+    total_valid_pixels: int,
+    total_pixels: int,
+    valid_stats_list: List[Dict[str, Any]],
+    pairwise_metrics: Dict[str, np.ndarray],
+    save_path: str,
 ) -> None:
     """
-    将对齐统计信息保存为 JSON 文件。
-
+    保存深度估计和位姿误差的评估指标到JSON文件。
+    
     Args:
-        shifts: 对齐偏移量列表
-        scales: 对齐缩放因子列表
-        stats_list: 统计信息字典列表，每个字典包含深度误差统计
-        json_path: 保存路径（包含文件名）
-    
-    Returns:
-        None
+        weighted_stats: 加权平均统计信息
+        stats_list: 每个视图的统计信息列表
+        total_valid_pixels: 总有效像素数
+        total_pixels: 总像素数
+        valid_stats_list: 有效视图的统计信息列表
+        pairwise_metrics: 位姿误差指标（包含rra和rta）
+        save_path: 保存路径
     """
-    # 转换 numpy 类型为 Python 原生类型，处理 NaN
-    def convert_to_json_serializable(obj):
-        """递归转换对象为 JSON 可序列化的类型"""
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            if np.isnan(obj):
-                return None
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {key: convert_to_json_serializable(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_to_json_serializable(item) for item in obj]
-        else:
-            return obj
-    
-    # 构建要保存的数据结构
-    data = {
-        "shifts": convert_to_json_serializable(shifts),
-        "scales": convert_to_json_serializable(scales),
-        "stats": convert_to_json_serializable(stats_list)
+    # 准备深度估计统计数据
+    depth_stats_summary = {
+        "weighted_average": {
+            "mean": float(weighted_stats['mean']),
+            "std": float(weighted_stats['std']),
+            "median": float(weighted_stats['median']),
+            "min": float(weighted_stats['min']),
+            "max": float(weighted_stats['max']),
+            "q25": float(weighted_stats['q25']),
+            "q75": float(weighted_stats['q75']),
+            "q95": float(weighted_stats['q95']),
+            "q99": float(weighted_stats['q99']),
+        },
+        "pixel_statistics": {
+            "total_valid_pixels": int(total_valid_pixels),
+            "total_pixels": int(total_pixels),
+            "valid_ratio_percent": float(total_valid_pixels / total_pixels * 100.0),
+            "num_views": len(stats_list),
+            "num_valid_views": len(valid_stats_list),
+        },
+        "per_view_statistics": [
+            {
+                "view_id": i,
+                "mean": float(stats_dict['mean']) if not np.isnan(stats_dict['mean']) else None,
+                "median": float(stats_dict['median']) if not np.isnan(stats_dict['median']) else None,
+                "std": float(stats_dict['std']) if not np.isnan(stats_dict['std']) else None,
+                "min": float(stats_dict['min']) if not np.isnan(stats_dict['min']) else None,
+                "max": float(stats_dict['max']) if not np.isnan(stats_dict['max']) else None,
+                "q25": float(stats_dict['q25']) if not np.isnan(stats_dict['q25']) else None,
+                "q75": float(stats_dict['q75']) if not np.isnan(stats_dict['q75']) else None,
+                "q95": float(stats_dict['q95']) if not np.isnan(stats_dict['q95']) else None,
+                "q99": float(stats_dict['q99']) if not np.isnan(stats_dict['q99']) else None,
+                "valid_pixels": int(stats_dict['valid_pixels']),
+                "total_pixels": int(stats_dict['total_pixels']),
+                "valid_ratio_percent": float(stats_dict['valid_ratio']),
+            }
+            for i, stats_dict in enumerate(stats_list)
+        ],
     }
     
-    # 确保目录存在
-    dir_path = os.path.dirname(json_path)
-    if dir_path:
-        os.makedirs(dir_path, exist_ok=True)
+    # 准备位姿误差统计数据
+    pose_stats_summary = {
+        "relative_rotation_angle_error": {
+            "mean": float(np.mean(pairwise_metrics["rra"])),
+            "std": float(np.std(pairwise_metrics["rra"])),
+            "median": float(np.median(pairwise_metrics["rra"])),
+            "min": float(np.min(pairwise_metrics["rra"])),
+            "max": float(np.max(pairwise_metrics["rra"])),
+        },
+        "relative_translation_amount_error": {
+            "mean": float(np.mean(pairwise_metrics["rta"])),
+            "std": float(np.std(pairwise_metrics["rta"])),
+            "median": float(np.median(pairwise_metrics["rta"])),
+            "min": float(np.min(pairwise_metrics["rta"])),
+            "max": float(np.max(pairwise_metrics["rta"])),
+        },
+        "pairwise_errors": {
+            "rra_errors": pairwise_metrics["rra"].tolist(),
+            "rta_errors": pairwise_metrics["rta"].tolist(),
+        },
+    }
     
-    # 保存为 JSON
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    # 合并所有统计数据
+    all_metrics = {
+        "depth_estimation": depth_stats_summary,
+        "pose_estimation": pose_stats_summary,
+    }
     
-    print(f"Alignment statistics saved to {json_path}")
+    # 保存到JSON文件
+    with open(save_path, 'w') as f:
+        json.dump(all_metrics, f, indent=2)
+    print(f"\n所有评估指标已保存到: {save_path}")
 
 
 def save_config_to_json(cfg: Any, json_path: str, additional_configs: Dict[str, Any] = None) -> None:
@@ -492,7 +533,7 @@ if __name__ == "__main__":
         device="cuda" if torch.cuda.is_available() else "cpu",
         dtype=torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16,
         checkpoint_path="/home/vision/ws/vggt/checkpoints/model.pt",
-        output_dir="/home/vision/ws/vggt/runs/exp_tokens_ot/results/depth_estimation/",
+        output_dir="/home/vision/ws/vggt/runs/exp_tokens_ot/results/",
         patch_size=14,
         special_tokens_num=5,
         dtu_root="/home/vision/ws/datasets/SampleSet/dtu_mvs",
@@ -503,8 +544,8 @@ if __name__ == "__main__":
         use_conf_filter=False,
         conf_percentile=30.0,
         max_depth_diff=50.0,
-        use_local_display=True,
-        save_results=False,
+        use_local_display=False,
+        save_results=True,
         knockout_layer_idx=[-1],
         knockout_method="top_k",
         knockout_random_ratio=0.5,
@@ -530,12 +571,16 @@ if __name__ == "__main__":
 
     # 添加时间戳到输出目录（用于 attn_map_save_dir）
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_output_dir = cfg.output_dir.rstrip("/")
-    save_root = f"{base_output_dir}_{timestamp}/"
+    save_root = os.path.join(cfg.output_dir, timestamp)
 
     if cfg.save_results:
         os.makedirs(save_root, exist_ok=True)
         print(f"Create output directory: {save_root}")
+        save_config_to_json(
+            cfg, 
+            os.path.join(save_root, "cfg.json"),
+            additional_configs={"token_fusion_strategy_cfg": token_fusion_strategy_cfg}
+        )
 
     model = VGGT(token_weighter=token_weighter)
     model.load_state_dict(torch.load(cfg.checkpoint_path))
@@ -710,22 +755,18 @@ if __name__ == "__main__":
         verbose=True,
     )
     
-    # 保存位姿误差结果
+    # 保存所有统计结果到JSON文件
     if cfg.save_results:
-        pose_error_path = os.path.join(save_root, "pose_error_metrics.json")
-        import json
-        # 将numpy数组转换为列表以便JSON序列化
-        pose_metrics_dict = {
-            "rra_error_mean": float(np.mean(pairwise_metrics["rra"])),
-            "rra_error_std": float(np.std(pairwise_metrics["rra"])),
-            "rra_error_median": float(np.median(pairwise_metrics["rra"])),
-            "rta_error_mean": float(np.mean(pairwise_metrics["rta"])),
-            "rta_error_std": float(np.std(pairwise_metrics["rta"])),
-            "rta_error_median": float(np.median(pairwise_metrics["rta"])),
-        }
-        with open(pose_error_path, 'w') as f:
-            json.dump(pairwise_metrics, f, indent=2)
-        print(f"\n位姿误差指标已保存到: {pose_error_path}")
+        metrics_path = os.path.join(save_root, "evaluation_metrics.json")
+        save_evaluation_metrics(
+            weighted_stats=weighted_stats,
+            stats_list=stats_list,
+            total_valid_pixels=total_valid_pixels,
+            total_pixels=total_pixels,
+            valid_stats_list=valid_stats_list,
+            pairwise_metrics=pairwise_metrics,
+            save_path=metrics_path,
+        )
 
     # if cfg.save_results:
     #     save_depth_estimation_results(aligned_pred_depths, pred_extrinsic, pred_intrinsic, gt_depths, gt_masks, stats_list, save_root)
@@ -762,9 +803,8 @@ if __name__ == "__main__":
         colors_flat_filtered = colors_flat[mask]
 
     if cfg.save_results:
-        save_point_cloud_to_ply(pred_points_from_depth_flat, colors_flat, os.path.join(save_root, "pred_points.ply"))
-        save_point_cloud_to_ply(gt_pts_from_depth_flat, colors_flat, os.path.join(save_root, "gt_points.ply"))
-        save_alignment_stats_to_json(shifts, scales, stats_list, os.path.join(save_root, "alignment_stats.json"))
+        # save_point_cloud_to_ply(pred_points_from_depth_flat, colors_flat, os.path.join(save_root, "pred_points.ply"))
+        # save_point_cloud_to_ply(gt_pts_from_depth_flat, colors_flat, os.path.join(save_root, "gt_points.ply"))
         save_config_to_json(
             cfg, 
             os.path.join(save_root, "cfg.json"),
