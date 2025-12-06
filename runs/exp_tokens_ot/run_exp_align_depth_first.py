@@ -611,55 +611,79 @@ if __name__ == "__main__":
         with torch.amp.autocast('cuda',dtype=cfg.dtype):
             predictions = model(gt_images)
 
-    if cfg.use_local_display:
-        if len(token_weighter.tokens_erank_kernel_norm)> 0:
-            plt.figure()
-            plt.plot(token_weighter.tokens_erank_kernel_norm, marker='o')
-            plt.title(f"tokens erank kernel norm Over Layers")
-            plt.xlabel("Layer Index")
-            plt.ylabel("tokens erank kernel norm")
-            plt.grid(True)
+    if len(token_weighter.tokens_erank_kernel_norm)> 0:
+        plt.figure()
+        plt.plot(token_weighter.tokens_erank_kernel_norm, marker='o')
+        plt.title(f"tokens erank kernel norm Over Layers")
+        plt.xlabel("Layer Index")
+        plt.ylabel("tokens erank kernel norm")
+        plt.grid(True)
+        if cfg.save_results:
+            plt.savefig(os.path.join(save_root, "tokens_erank_kernel_norm.png"))
+        if cfg.use_local_display:
             plt.show()
+        else:
+            plt.close()
         
-        if len(token_weighter.tokens_erank_fro_norm) > 0:
-            plt.figure()
-            plt.plot(token_weighter.tokens_erank_fro_norm, marker='x')
-            plt.title(f"tokens erank fro norm Over Layers")
-            plt.xlabel("Layer Index")
-            plt.ylabel("tokens erank fro norm")
-            plt.grid(True)
+    if len(token_weighter.tokens_erank_fro_norm) > 0:
+        plt.figure()
+        plt.plot(token_weighter.tokens_erank_fro_norm, marker='x')
+        plt.title(f"tokens erank fro norm Over Layers")
+        plt.xlabel("Layer Index")
+        plt.ylabel("tokens erank fro norm")
+        plt.grid(True)
+        if cfg.save_results:
+            plt.savefig(os.path.join(save_root, "tokens_erank_fro_norm.png"))
+        if cfg.use_local_display:
             plt.show()
-
-        if len(token_weighter.q_rope_gain) > 0 or len(token_weighter.top_k_dominance) > 0:
-            plt.figure()
-            if len(token_weighter.q_rope_gain) > 0:
-                plt.plot(token_weighter.q_rope_gain, marker='o')
-            if len(token_weighter.top_k_dominance) > 0:
-                plt.plot(token_weighter.top_k_dominance, marker='x')
-            plt.title(f"rope gain and top-k dominance Over Layers")
-            plt.xlabel("Layer Index")
-            plt.ylabel("ratio(rope gain / q_original & top-k num / num_keys)")
-            plt.grid(True)
-            plt.show()
+        else:
+            plt.close()
     
-        if len(token_weighter.top_k_dominance) > 0:
-            plt.figure()
-            layer_indices = range(len(token_weighter.top_k_dominance))
-            plt.bar(layer_indices, token_weighter.top_k_dominance)
-            plt.title(f"top-k dominance Over Layers")
-            plt.xlabel("Layer Index")
-            plt.ylabel("top-k dominance")
-            plt.grid(True, axis='y')
+    if len(token_weighter.x_cos_similarity) > 0:
+        plt.figure()
+        plt.plot(token_weighter.x_cos_similarity, marker='o')
+        plt.title(f"token cos similarity Over Layers")
+        plt.xlabel("Layer Index")
+        plt.ylabel("token cos similarity")
+        plt.grid(True)
+        if cfg.save_results:
+            plt.savefig(os.path.join(save_root, "x_cos_similarity.png"))
+        if cfg.use_local_display:
             plt.show()
+        else:
+            plt.close()
 
-        if len(token_weighter.x_cos_similarity) > 0:
-            plt.figure()
-            plt.plot(token_weighter.x_cos_similarity, marker='o')
-            plt.title(f"token cos similarity Over Layers")
-            plt.xlabel("Layer Index")
-            plt.ylabel("token cos similarity")
-            plt.grid(True)
+    if len(token_weighter.q_rope_gain) > 0 or len(token_weighter.top_k_dominance) > 0:
+        plt.figure()
+        if len(token_weighter.q_rope_gain) > 0:
+            plt.plot(token_weighter.q_rope_gain, marker='o')
+        if len(token_weighter.top_k_dominance) > 0:
+            plt.plot(token_weighter.top_k_dominance, marker='x')
+        plt.title(f"rope gain and top-k dominance Over Layers")
+        plt.xlabel("Layer Index")
+        plt.ylabel("ratio(rope gain / q_original & top-k num / num_keys)")
+        plt.grid(True)
+        if cfg.save_results:
+            plt.savefig(os.path.join(save_root, "rope_gain_top_k_dominance.png"))
+        if cfg.use_local_display:
             plt.show()
+        else:
+            plt.close()
+    
+    if len(token_weighter.top_k_dominance) > 0:
+        plt.figure()
+        layer_indices = range(len(token_weighter.top_k_dominance))
+        plt.bar(layer_indices, token_weighter.top_k_dominance)
+        plt.title(f"top-k dominance Over Layers")
+        plt.xlabel("Layer Index")
+        plt.ylabel("top-k dominance")
+        plt.grid(True, axis='y')
+        if cfg.save_results:
+            plt.savefig(os.path.join(save_root, "top_k_dominance.png"))
+        if cfg.use_local_display:
+            plt.show()
+        else:
+            plt.close()
 
 
     # gt_images: [S, 3, H, W]，VGGT 内部会加 batch 维度 => pose_enc: [B, S, 9]
