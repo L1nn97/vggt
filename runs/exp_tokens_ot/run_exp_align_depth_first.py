@@ -544,12 +544,12 @@ if __name__ == "__main__":
         use_conf_filter=False,
         conf_percentile=30.0,
         max_depth_diff=50.0,
-        knockout_layer_idx=[13,14,15],
+        knockout_layer_idx=[],
         knockout_method="corres_mask",
         knockout_random_ratio=0.5,
         knockout_top_k=100,
         use_local_display=True,
-        save_results=False,
+        save_results=True,
     )
 
     token_fusion_strategy_cfg = TokenFusionStrategyConfig(
@@ -607,9 +607,30 @@ if __name__ == "__main__":
     # print("gt_intrinsics.shape: ", gt_intrinsics.shape)
     # print("gt_extrinsics.shape: ", gt_extrinsics.shape)
 
+    import torch
+    from torch.profiler import profile, record_function, ProfilerActivity
+
+
     with torch.no_grad():
-        with torch.amp.autocast('cuda',dtype=cfg.dtype):
+        with torch.amp.autocast(cfg.device,dtype=cfg.dtype):
+            current_memory = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
             predictions = model(gt_images)
+            additional_memory = torch.cuda.memory_allocated() - (current_memory + 1e9)
+            peak_memory = torch.cuda.max_memory_allocated()
+            additional_peak_memory = peak_memory - (current_memory + 1e9)
+
+            print(f"Additional memory used: {additional_memory / (1024 ** 3)} GB")
+            print(f"Additional peak memory used: {additional_peak_memory / (1024 ** 3)} GB")
+
+            if cfg.save_results:
+                with open(os.path.join(save_root, "memory_usage.txt"), "a") as f:
+                    f.write(f"Additional memory used: {additional_memory / (1024 ** 3)} GB\n")
+                    f.write(f"Additional peak memory used: {additional_peak_memory / (1024 ** 3)} GB\n")
+                    f.write(f"Current memory: {current_memory / (1024 ** 3)} GB\n")
+                    f.write(f"Peak memory: {peak_memory / (1024 ** 3)} GB\n")
+
+
 
     if len(token_weighter.tokens_erank_kernel_norm)> 0:
         plt.figure()
