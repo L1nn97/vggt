@@ -107,9 +107,8 @@ def reproj_world_coords_to_image(world_coords_src: np.ndarray, intrinsic_tgt: np
     reproj_uv, reproj_cam = project_3D_points_np(
         points3D, extrinsics_batch, intrinsics_batch
     )
-    # reproj_uv shape: (1, N, 2) -> (N, 2)
-    reproj_uv = reproj_uv[0].reshape(world_coords_src.shape[0], world_coords_src.shape[1], 2)  # (H, W, 2)
-    return reproj_uv
+
+    return reproj_uv[0]
 
 def apply_heatmap(image, heatmap, alpha=0.4):
     """
@@ -226,6 +225,10 @@ class TokenFusionStrategy:
 
         # for attention rollout calculation
         self.attention_map_rollout = None
+
+        # for percise corresponding attention knockout
+        self.corres_masks = self.calculate_corresponding_attention_mask()
+
 
     def calculate_token_cos_similarity(self, x: Tensor, curr_layer_idx: int):
         def matrix_norms(tokens):
@@ -375,7 +378,7 @@ class TokenFusionStrategy:
 
         src_image_crop = image_0[src_pnts_uv[..., 1], src_pnts_uv[..., 0]]
         world_coords_crop = world_coords_0[src_pnts_uv[..., 1], src_pnts_uv[..., 0]]
-        reproj_uv_crop = reproj_world_coords_to_image(world_coords_crop, intrinsic_1, extrinsic_1)
+        reproj_uv_crop = reproj_world_coords_to_image(world_coords_crop, intrinsic_1, extrinsic_1).reshape(world_coords_crop.shape[0], world_coords_crop.shape[1], 2)
         reproj_uv_crop_int = reproj_uv_crop.astype(np.int32)
 
         valid_mask = (
@@ -437,11 +440,52 @@ class TokenFusionStrategy:
         # plt.imshow(reproj_mask)
         # plt.show()
 
+    def calculate_corresponding_attention_mask(self) -> list[list[int]]:
+        stride = 3
+        def calc_corres_attn_mask_token_i(img_idx: int, row_idx: int, col_idx: int):
+            patch_center_uv = (col_idx * 14 + 7, row_idx * 14 + 7)
+            patch_center_world_coords = self.world_coords[img_idx][patch_center_uv[1], patch_center_uv[0]]
+            valid_u = range(max(0, col_idx - stride), min(self.num_tokens_per_image_on_width - 1, col_idx + stride))
+            valid_v = range(max(0, row_idx - stride), min(self.num_tokens_per_image_on_height - 1, row_idx + stride))
+            valid_token_idx = []
+            for u in valid_u:
+                for v in valid_v:
+                    valid_token_idx.append(img_idx * (self.num_tokens_per_image + self.special_tokens_num) + self.special_tokens_num + v * self.num_tokens_per_image_on_width + u)
+
+            for i in range(self.num_views):
+                if i == img_idx:
+                    continue
+                patch_center_reproj_uv = reproj_world_coords_to_image(patch_center_world_coords, self.intrinsics[i], self.extrinsics[i]).astype(np.int32)
+                u, v = patch_center_reproj_uv[0]
+                if(u < 0 or u >= self.width or v < 0 or v >= self.height):
+                    continue
+                if(np.linalg.norm(patch_center_world_coords - self.world_coords[i][v, u]) > 20):
+                    continue
+                patch_u = u // self.patch_size
+                patch_v = v // self.patch_size
+                valid_u = range(max(0, patch_u - stride), min(self.num_tokens_per_image_on_width - 1, patch_u + stride))
+                valid_v = range(max(0, patch_v - stride), min(self.num_tokens_per_image_on_height - 1, patch_v + stride))
+                valid_token_idx.append(i * (self.num_tokens_per_image + self.special_tokens_num) + self.special_tokens_num + patch_v * self.num_tokens_per_image_on_width + patch_u)
+                for u in valid_u:
+                    for v in valid_v:
+                        valid_token_idx.append(i * (self.num_tokens_per_image + self.special_tokens_num) + self.special_tokens_num + v * self.num_tokens_per_image_on_width + u)
+
+            return valid_token_idx
+
+
+        corres_masks = []
+        for i in range(self.num_views):
+            for r in range(self.num_tokens_per_image_on_height):
+                for c in range(self.num_tokens_per_image_on_width):
+                    corres_masks.append(calc_corres_attn_mask_token_i(i, r, c))
+        return corres_masks
+       
+
     def calculate_visible_score(self, src_view_idx: int, tgt_view_idx: int) -> np.ndarray:
         image_0, depth_0, mask_0, world_coords_0, intrinsic_0, extrinsic_0 = self.images[src_view_idx], self.depths[src_view_idx], self.masks[src_view_idx], self.world_coords[src_view_idx], self.intrinsics[src_view_idx], self.extrinsics[src_view_idx]
         image_1, depth_1, mask_1, world_coords_1, intrinsic_1, extrinsic_1 = self.images[tgt_view_idx], self.depths[tgt_view_idx], self.masks[tgt_view_idx], self.world_coords[tgt_view_idx], self.intrinsics[tgt_view_idx], self.extrinsics[tgt_view_idx]
 
-        reproj_uv_0 = reproj_world_coords_to_image(world_coords_0, intrinsic_1, extrinsic_1)
+        reproj_uv_0 = reproj_world_coords_to_image(world_coords_0, intrinsic_1, extrinsic_1).reshape(world_coords_0.shape[0], world_coords_0.shape[1], 2)
         reproj_uv_int = reproj_uv_0.astype(np.int32)
         
         valid_mask = (
@@ -500,6 +544,9 @@ class TokenFusionStrategy:
         elif self.knockout_method == "top_k":
             print("top-k preserved knockout for layer: ", curr_layer_idx)
             return top_k_preserved_knockout(attn_map, self.num_views, self.num_tokens_per_image, self.width // self.patch_size, self.height // self.patch_size, self.knockout_top_k, fill_value)
+        elif self.knockout_method == "corres_mask":
+            print("corres mask knockout for layer: ", curr_layer_idx)
+            return corres_mask_knockout(attn_map, self.num_views, self.num_tokens_per_image, self.width // self.patch_size, self.height // self.patch_size, self.corres_masks, fill_value)
         else:
             raise ValueError(f"Invalid knockout method: {self.knockout_method}")
 

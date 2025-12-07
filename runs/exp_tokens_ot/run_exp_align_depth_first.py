@@ -544,12 +544,12 @@ if __name__ == "__main__":
         use_conf_filter=False,
         conf_percentile=30.0,
         max_depth_diff=50.0,
-        use_local_display=False,
-        save_results=True,
-        knockout_layer_idx=[-1],
-        knockout_method="top_k",
+        knockout_layer_idx=[13,14,15],
+        knockout_method="corres_mask",
         knockout_random_ratio=0.5,
-        knockout_top_k=100
+        knockout_top_k=100,
+        use_local_display=True,
+        save_results=False,
     )
 
     token_fusion_strategy_cfg = TokenFusionStrategyConfig(
