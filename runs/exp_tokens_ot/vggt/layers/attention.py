@@ -76,9 +76,9 @@ class GlobalAttentionWithTokenMerge(nn.Module):
 
     def forward(self, x: Tensor, pos=None, idx=None) -> Tensor:
 
-        # self.token_weighter.calculate_token_cos_similarity(x, idx)
+        self.token_weighter.calculate_token_cos_similarity(x, idx)
         # print(f"visualize token similarity heatmap of layer {idx}")
-        # self.token_weighter.visualize_token_similarity_heatmap(x, [1, 2, 3, 4, 931, 932, 933, 934], [0, 1, 2, 3])
+        self.token_weighter.visualize_token_similarity_heatmap(x, [500], [0, 1, 2, 3])
 
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -91,14 +91,14 @@ class GlobalAttentionWithTokenMerge(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        # calculate rope gain
+        # # calculate rope gain
         # self.token_weighter.calculate_rope_gain(q_original, q)
         # del q_original
 
         enable_token_merge = False
         self.merge_ratio = 0.5
         self.patch_width = 37
-        self.patch_height = 25
+        self.patch_height = 24
         if enable_token_merge:
             generator = torch.Generator(device=x.device)
             generator.manual_seed(33)
@@ -125,10 +125,6 @@ class GlobalAttentionWithTokenMerge(nn.Module):
             k_merge_in = k.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
             v_merge_in = v.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
 
-            print(f"q_merge_in.shape: {q_merge_in.shape}")
-            print(f"k_merge_in.shape: {k_merge_in.shape}")
-            print(f"v_merge_in.shape: {v_merge_in.shape}")
-
             q_out, k_out, v_out = m_a(
                 q_merge_in,
                 mode="mean",
@@ -136,9 +132,7 @@ class GlobalAttentionWithTokenMerge(nn.Module):
                 extra_tensors_2=v_merge_in,
             )
 
-            print(f"q_out.shape: {q_out.shape}")
-            print(f"k_out.shape: {k_out.shape}")
-            print(f"v_out.shape: {v_out.shape}")
+            print(f"Token Merge qkv length ratio: {q_out.shape} / {q_merge_in.shape}")
 
             del q_merge_in, k_merge_in, v_merge_in
 
@@ -180,18 +174,18 @@ class GlobalAttentionWithTokenMerge(nn.Module):
             #     self.token_weighter.visualize_attn_map(attn_before_softmax, [0, 500, 930, 1430], [0, 1, 2])
 
             attn_before_softmax = self.token_weighter.attention_knockout(attn_before_softmax, idx)
+            # self.token_weighter.visualize_attn_map_all_heads(attn_before_softmax, 100, 1)
             attn_after_softmax = attn_before_softmax.softmax(dim=-1)
 
-            patch_row, patch_col = 0, 0
-            print(f"idx: {idx}")
+            # patch_row, patch_col = 0, 0
             # self.token_weighter.calculate_visible_mask(attn_before_softmax, (patch_row, patch_col), 0, 1)
 
-            # # 显示softmax之后的注意力图，更容易观察到注意力中的匹配现象
+            # 显示softmax之后的注意力图，更容易观察到注意力中的匹配现象
             # display_attn_map_after_softmax = False
             # if display_attn_map_after_softmax:
             #     print(f"Display attn map after softmax of layer {idx}")
-            #     self.token_weighter.visualize_attn_map(attn_after_softmax, [0, 1, 2, 3, 4], [0, 1, 2, 3])
-            #     self.token_weighter.visualize_attn_map(attn_after_softmax, [500, 800], [0, 1, 2, 3])
+            # self.token_weighter.visualize_attn_map_all_heads(attn_after_softmax, 100, 1)
+                # self.token_weighter.visualize_attn_map(attn_after_softmax, [500, 800], [0, 1, 2, 3], 0)
 
             # # 计算after softmax 之后的 top-k dominance 达到百分之90的token比例
             # calculate_top_k_dominance = False

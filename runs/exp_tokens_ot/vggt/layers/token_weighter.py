@@ -229,6 +229,10 @@ class TokenFusionStrategy:
         # for percise corresponding attention knockout
         self.corres_masks = self.calculate_corresponding_attention_mask()
 
+        self.attention_of_all_heads = []
+
+        self.token_cosine_similarity = []
+
 
     def calculate_token_cos_similarity(self, x: Tensor, curr_layer_idx: int):
         def matrix_norms(tokens):
@@ -245,6 +249,9 @@ class TokenFusionStrategy:
         x_normed /= x_normed.norm(dim=-1, keepdim=True)
         # cos_sim = torch.abs(torch.mm(x_normed, x_normed.t())) # 这里取不取abs有一些影响但是不大
         cos_sim = torch.mm(x_normed, x_normed.t())
+        # plt.imshow(cos_sim.cpu().numpy())
+        # plt.colorbar()
+        # plt.show()
         cos_sim_mean = cos_sim.mean().item()
 
         self.tokens_erank_kernel_norm.append(knl.item() / spectral.item())
@@ -261,16 +268,18 @@ class TokenFusionStrategy:
         similarity_heatmaps = []
         for image_idx_i in image_idx:
             for token_idx_i in token_idx:
-                similarity_heatmap = cos_sim[token_idx_i, image_idx_i * 930 : (image_idx_i + 1) * 930][5:].cpu().numpy().reshape(25, 37).astype(np.float32)
+                similarity_heatmap = cos_sim[token_idx_i, image_idx_i * (self.num_tokens_per_image + 5) : (image_idx_i + 1) * (self.num_tokens_per_image + 5)][5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width).astype(np.float32)
                 similarity_heatmap = cv2.resize(similarity_heatmap, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
                 blended_image = apply_heatmap(self.images[image_idx_i], similarity_heatmap, alpha = 0.8)
                 similarity_heatmaps.append(blended_image)
 
         # plot by grid concat
         grid_img = np.concatenate([np.concatenate(similarity_heatmaps[i*len(token_idx):(i+1)*len(token_idx)], axis=0) for i in range(len(image_idx))], axis=1)
-        plt.imshow(grid_img)
-        plt.colorbar()
-        plt.show()
+        self.token_cosine_similarity.append(grid_img)
+
+        # plt.imshow(grid_img)
+        # plt.colorbar()
+        # plt.show()
         
 
     def calculate_rope_gain(self, q_original: Tensor, q_rope: Tensor):
@@ -322,7 +331,7 @@ class TokenFusionStrategy:
         self.top_k_dominance.append(k_mean)
         return k_mean, k_per_query
 
-    def visualize_attn_map(self, attn_map: Tensor, token_idx: list[int], image_idx: list[int]):
+    def visualize_attn_map(self, attn_map: Tensor, token_idx: list[int], image_idx: list[int], head=None):
         """
             这是一个实验函数，用来绘制 token_idx 对于 image_idx 的注意力图
 
@@ -340,7 +349,11 @@ class TokenFusionStrategy:
             if token_idx > self.num_views * (self.num_tokens_per_image + self.special_tokens_num) or image_idx > self.num_views - 1:
                 print(f"token_idx: {token_idx} or image_idx: {image_idx} is out of range")
                 return np.zeros((self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width ))
-            target_attn_map_original = attn_map.squeeze(0).mean(0)
+            if head is None:
+                target_attn_map_original = attn_map.squeeze(0).mean(0)
+            else:
+                target_attn_map_original = attn_map.squeeze(0)[head]
+
             # target_attn_map_original = attn_map.squeeze(0).sum(dim=0)
             target_attn = target_attn_map_original[token_idx, image_idx * 930 : (image_idx + 1) * 930]
             target_attn_map = target_attn[5:].cpu().numpy().reshape(25, 37)
@@ -361,6 +374,53 @@ class TokenFusionStrategy:
         plt.colorbar()
         plt.show()
         return target_attn_maps
+
+
+    def visualize_attn_map_all_heads(self, attn_map: Tensor, token_idx: int, image_idx: int):
+        """
+            这是一个实验函数，用来绘制 token_idx 对于 image_idx 的注意力图
+
+            Usage:
+                # FastVGGT 实验中的图是softmax之前的， 用来观察attention collapse现象
+                # print(f"attn map before softmax of layer {idx}")
+                # self.token_weighter.visualize_attn_map(attn_before_softmax, [0, 500, 930, 1430], [0, 1, 2])
+
+                # 我的图是softmax之后的，更容易观察到注意力中的匹配现象
+                # print(f"attn map after softmax of layer {idx}")
+                # self.token_weighter.visualize_attn_map(attn_after_softmax, [0, 500, 930, 1430], [0, 1, 2])
+
+        """
+        def get_attn_map(attn_map: Tensor, token_idx: int, image_idx: int, head: int):
+            if token_idx > self.num_views * (self.num_tokens_per_image + self.special_tokens_num) or image_idx > self.num_views - 1:
+                print(f"token_idx: {token_idx} or image_idx: {image_idx} is out of range")
+                return np.zeros((self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width ))
+            if head is not None:
+                target_attn_map_original = attn_map.squeeze(0)[head]
+            else:
+                target_attn_map_original = attn_map.squeeze(0).mean(0)
+
+            # target_attn_map_original = attn_map.squeeze(0).sum(dim=0)
+            target_attn = target_attn_map_original[token_idx, image_idx * (self.num_tokens_per_image + 5) : (image_idx + 1) * (self.num_tokens_per_image + 5)]
+            target_attn_map = target_attn[5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width)
+            del target_attn_map_original, target_attn
+            return target_attn_map.astype(np.float32)
+
+        target_attn_maps = []
+        for head in range(16):
+            target_attn_map = get_attn_map(attn_map, token_idx, image_idx, head)
+            target_attn_map = cv2.resize(target_attn_map, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+            blended_image = apply_heatmap(self.images[image_idx], target_attn_map, alpha = 0.8)
+            target_attn_maps.append(blended_image)
+        
+        target_attn_map = get_attn_map(attn_map, token_idx, image_idx, None)
+        target_attn_map = cv2.resize(target_attn_map, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        blended_image = apply_heatmap(self.images[image_idx], target_attn_map, alpha = 0.8)
+        target_attn_maps.append(blended_image)
+
+        # plot by grid concat
+        grid_img = np.concatenate(target_attn_maps, axis=1)
+        self.attention_of_all_heads.append(grid_img)
+
 
     def calculate_visible_mask(self, attn_map: Tensor, src_patch_idx: Tuple[int, int], src_view_idx: int, tgt_view_idx: int) -> np.ndarray:
         image_0, depth_0, mask_0, world_coords_0, intrinsic_0, extrinsic_0 = self.images[src_view_idx], self.depths[src_view_idx], self.masks[src_view_idx], self.world_coords[src_view_idx], self.intrinsics[src_view_idx], self.extrinsics[src_view_idx]

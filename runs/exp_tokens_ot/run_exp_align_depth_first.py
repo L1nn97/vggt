@@ -537,7 +537,8 @@ if __name__ == "__main__":
         patch_size=14,
         special_tokens_num=5,
         dtu_root="/home/vision/ws/datasets/SampleSet/dtu_mvs",
-        target_size=(518, 350),
+        target_size=(518, 336),
+        # target_size=(252, 168),
         scan_id=1,
         num_views=4,
         view_step=1,
@@ -629,8 +630,37 @@ if __name__ == "__main__":
                     f.write(f"Additional peak memory used: {additional_peak_memory / (1024 ** 3)} GB\n")
                     f.write(f"Current memory: {current_memory / (1024 ** 3)} GB\n")
                     f.write(f"Peak memory: {peak_memory / (1024 ** 3)} GB\n")
+    
+    if len(token_weighter.token_cosine_similarity) > 0:
+        plt.figure()
+        token_similarity_image = np.concatenate(token_weighter.token_cosine_similarity, axis=0)
+        plt.imshow(token_similarity_image)
+        plt.title(f"token cosine similarity")
+        plt.xlabel("Layer Index")
+        plt.ylabel("token cosine similarity")
+        plt.grid(False)
+        if cfg.save_results:
+            plt.savefig(os.path.join(save_root, "token_cosine_similarity.png"))
+        if cfg.use_local_display:
+            plt.show()
+        else:
+            plt.close()
 
-
+    if len(token_weighter.attention_of_all_heads) > 0:
+        all_heads_attn_map = np.concatenate(token_weighter.attention_of_all_heads, axis=0)
+        plt.figure()
+        plt.imshow(all_heads_attn_map)
+        plt.colorbar()
+        plt.title(f"all heads attention map")
+        plt.xlabel("Layer Index")
+        plt.ylabel("all heads attention map")
+        plt.grid(False)
+        if cfg.save_results:
+            plt.savefig(os.path.join(save_root, "all_heads_attention_map.png"))
+        if cfg.use_local_display:
+            plt.show()
+        else:
+            plt.close()
 
     if len(token_weighter.tokens_erank_kernel_norm)> 0:
         plt.figure()
