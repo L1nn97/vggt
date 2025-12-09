@@ -244,6 +244,7 @@ class TokenFusionStrategy:
 
         D = x.shape[-1]
         x_normed = x.reshape(-1, D).clone()
+        N = x_normed.shape[0]
 
         spectral, knl, fro = matrix_norms(x_normed)
         x_normed /= x_normed.norm(dim=-1, keepdim=True)
@@ -254,8 +255,8 @@ class TokenFusionStrategy:
         # plt.show()
         cos_sim_mean = cos_sim.mean().item()
 
-        self.tokens_erank_kernel_norm.append(knl.item() / spectral.item())
-        self.tokens_erank_fro_norm.append(fro.item() / spectral.item())
+        self.tokens_erank_kernel_norm.append(knl.item() / (N *spectral.item()))
+        self.tokens_erank_fro_norm.append(fro.item() / (N * spectral.item()))
         self.x_cos_similarity.append(cos_sim_mean)
         del x_normed, cos_sim
 
@@ -268,7 +269,8 @@ class TokenFusionStrategy:
         similarity_heatmaps = []
         for image_idx_i in image_idx:
             for token_idx_i in token_idx:
-                similarity_heatmap = cos_sim[token_idx_i, image_idx_i * (self.num_tokens_per_image + 5) : (image_idx_i + 1) * (self.num_tokens_per_image + 5)][5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width).astype(np.float32)
+                cos_sim_fp32 = cos_sim.float()
+                similarity_heatmap = cos_sim_fp32[token_idx_i, image_idx_i * (self.num_tokens_per_image + 5) : (image_idx_i + 1) * (self.num_tokens_per_image + 5)][5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width)
                 similarity_heatmap = cv2.resize(similarity_heatmap, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
                 blended_image = apply_heatmap(self.images[image_idx_i], similarity_heatmap, alpha = 0.8)
                 similarity_heatmaps.append(blended_image)
