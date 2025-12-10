@@ -76,9 +76,13 @@ class GlobalAttentionWithTokenMerge(nn.Module):
 
     def forward(self, x: Tensor, pos=None, idx=None) -> Tensor:
 
-        self.token_weighter.calculate_token_cos_similarity(x, idx)
+        # skip_layer_idx = [0, 1, 2, 3]
+        # if idx in skip_layer_idx:
+        #     return x
+        
+        # self.token_weighter.calculate_token_cos_similarity(x, idx)
         # print(f"visualize token similarity heatmap of layer {idx}")
-        self.token_weighter.visualize_token_similarity_heatmap(x, [500], [0, 1, 2, 3])
+        # self.token_weighter.visualize_token_similarity_heatmap(x, [491+5, 794+5], [0, 1, 2, 3])
 
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -173,9 +177,10 @@ class GlobalAttentionWithTokenMerge(nn.Module):
             #     print(f"Display attn map before softmax of layer {idx}")
             #     self.token_weighter.visualize_attn_map(attn_before_softmax, [0, 500, 930, 1430], [0, 1, 2])
 
-            attn_before_softmax = self.token_weighter.attention_knockout(attn_before_softmax, idx)
+            # attn_before_softmax = self.token_weighter.attention_knockout(attn_before_softmax, idx)
             # self.token_weighter.visualize_attn_map_all_heads(attn_before_softmax, 100, 1)
             attn_after_softmax = attn_before_softmax.softmax(dim=-1)
+            # attn_after_softmax = self.token_weighter.attention_knockout(attn_after_softmax, idx)
 
             # patch_row, patch_col = 0, 0
             # self.token_weighter.calculate_visible_mask(attn_before_softmax, (patch_row, patch_col), 0, 1)
@@ -184,10 +189,10 @@ class GlobalAttentionWithTokenMerge(nn.Module):
             # display_attn_map_after_softmax = False
             # if display_attn_map_after_softmax:
             #     print(f"Display attn map after softmax of layer {idx}")
-            # self.token_weighter.visualize_attn_map_all_heads(attn_after_softmax, 100, 1)
+            # self.token_weighter.visualize_attn_map_all_heads(attn_after_softmax, 491+5, 1)
                 # self.token_weighter.visualize_attn_map(attn_after_softmax, [500, 800], [0, 1, 2, 3], 0)
 
-            # # 计算after softmax 之后的 top-k dominance 达到百分之90的token比例
+            # 计算after softmax 之后的 top-k dominance 达到百分之90的token比例
             # calculate_top_k_dominance = False
             # if calculate_top_k_dominance:
             #     k_mean, k_per_query = self.token_weighter.calculate_top_k_dominance(attn_after_softmax)

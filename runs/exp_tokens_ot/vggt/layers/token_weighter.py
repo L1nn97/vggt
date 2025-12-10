@@ -267,8 +267,8 @@ class TokenFusionStrategy:
         cos_sim = torch.mm(x_normed, x_normed.t())
 
         similarity_heatmaps = []
-        for image_idx_i in image_idx:
-            for token_idx_i in token_idx:
+        for token_idx_i in token_idx:
+            for image_idx_i in image_idx:
                 cos_sim_fp32 = cos_sim.float()
                 similarity_heatmap = cos_sim_fp32[token_idx_i, image_idx_i * (self.num_tokens_per_image + 5) : (image_idx_i + 1) * (self.num_tokens_per_image + 5)][5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width)
                 similarity_heatmap = cv2.resize(similarity_heatmap, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
@@ -276,7 +276,7 @@ class TokenFusionStrategy:
                 similarity_heatmaps.append(blended_image)
 
         # plot by grid concat
-        grid_img = np.concatenate([np.concatenate(similarity_heatmaps[i*len(token_idx):(i+1)*len(token_idx)], axis=0) for i in range(len(image_idx))], axis=1)
+        grid_img = np.concatenate([np.concatenate(similarity_heatmaps[i*len(image_idx):(i+1)*len(image_idx)], axis=1) for i in range(len(token_idx))], axis=1)
         self.token_cosine_similarity.append(grid_img)
 
         # plt.imshow(grid_img)
@@ -503,7 +503,7 @@ class TokenFusionStrategy:
         # plt.show()
 
     def calculate_corresponding_attention_mask(self) -> list[list[int]]:
-        stride = 3
+        stride = 5
         def calc_corres_attn_mask_token_i(img_idx: int, row_idx: int, col_idx: int):
             patch_center_uv = (col_idx * 14 + 7, row_idx * 14 + 7)
             patch_center_world_coords = self.world_coords[img_idx][patch_center_uv[1], patch_center_uv[0]]
@@ -596,7 +596,8 @@ class TokenFusionStrategy:
         if curr_layer_idx not in self.knockout_layer_idx and -1 not in self.knockout_layer_idx:
             return attn_map
 
-        fill_value = float('-inf')
+        # fill_value = float('-inf')
+        fill_value = 0.0
         if self.knockout_method == "random":
             print("random knockout for layer: ", curr_layer_idx)
             return random_knockout(attn_map, self.num_views, self.num_tokens_per_image, self.width // self.patch_size, self.height // self.patch_size, self.knockout_random_ratio, fill_value)

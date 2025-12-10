@@ -349,8 +349,8 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
     for i in range(num_images):
         for r in range(height):
             for c in range(width):
-                idx = i * 925 + r * width + c
-                query_idx = i * 930 + 5 + r * width + c
+                idx = i * num_patches_per_image + r * width + c
+                query_idx = i * num_tokens_per_image_total + 5 + r * width + c
                 valid_keys = corres_masks[idx]
                 mask = torch.ones(x.shape[-1], dtype=torch.bool, device=x.device)
                 if len(valid_keys) > 0:
