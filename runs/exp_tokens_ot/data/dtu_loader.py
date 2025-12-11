@@ -3,6 +3,7 @@ import torch
 import glob
 import numpy as np
 import cv2
+import open3d as o3d
 from typing import List, Tuple, Dict, Optional
 
 current_work_dir = os.getcwd()
@@ -244,6 +245,7 @@ class DTUScanLoader:
         self.image_paths = self._collect_images()
         self.mask_paths = self._collect_masks()
         self.depth_paths = self._collect_depths()
+        self.point_path = os.path.join(self.scan_dir, f"{int(scan_id):03d}_pcd.ply")
 
         self.image_paths = self._subsample(self.image_paths, self.num_views, self.step)
 
@@ -411,6 +413,20 @@ class DTUScanLoader:
     def load_depths(self):
         depths = default_depth_loader(self.depth_paths, self.device, self.resize_size)
         return self._crop_tensor_or_list(depths)
+    
+    def load_points(self):
+        pcd = o3d.io.read_point_cloud(self.point_path)
+
+        # Convert to numpy arrays
+        points = np.asarray(pcd.points)
+        colors = None
+        try:
+            if pcd.has_colors():
+                colors = np.asarray(pcd.colors)
+        except Exception:
+            colors = None
+
+        return torch.from_numpy(points).to(self.device), torch.from_numpy(colors).to(self.device)
 
     def load_cameras(self) -> Tuple[np.ndarray, np.ndarray]:
         """

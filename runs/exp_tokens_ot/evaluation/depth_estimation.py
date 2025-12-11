@@ -46,25 +46,6 @@ def align_pred_to_gt(
     valid_mask: np.ndarray,
     min_valid_pixels: int = 100,
 ) -> tuple[float, float, np.ndarray]:
-    """
-    Code snippet from: https://github.com/facebookresearch/vggt/issues/208
-
-    Align predicted depth map to ground truth depth map using a scale and shift,
-    such that: gt_depth ≈ scale * pred_depth + shift.
-
-    Args:
-        pred_depth (np.ndarray): (H, W) predicted depth.
-        gt_depth (np.ndarray): (H, W) ground truth depth.
-        valid_mask (np.ndarray): (H, W) mask indicating valid pixels.
-        min_valid_pixels (int): Minimum valid pixels required for alignment.
-
-    Returns:
-        tuple[float, float, np.ndarray]:
-            scale: The calculated scale value (NaN if failed).
-            shift: The calculated shift value (NaN if failed).
-            aligned_pred_depth: (H, W) predicted depth after alignment 
-                                (input pred_depth if alignment failed).
-    """
     if pred_depth.shape != gt_depth.shape:
         raise ValueError(
             f"Predicted depth shape {pred_depth.shape} must match GT depth shape {gt_depth.shape}"
@@ -73,37 +54,50 @@ def align_pred_to_gt(
     valid_mask = valid_mask.astype(bool)
 
     # Extract valid depth values
-    gt_masked = gt_depth[valid_mask]
-    pred_masked = pred_depth[valid_mask]
-
-    if len(gt_masked) < min_valid_pixels:
-        print(
-            f"Warning: Not enough valid pixels ({len(gt_masked)} < {min_valid_pixels}) to align. "
-            "Using all pixels."
-        )
-        gt_masked = gt_depth.reshape(-1)
-        pred_masked = pred_depth.reshape(-1)
-
+    gt_masked = gt_depth[valid_mask].reshape(-1)
+    pred_masked = pred_depth[valid_mask].reshape(-1)
 
     # Handle case where pred_masked has no variance (e.g., all zeros or a constant value)
     if np.std(pred_masked) < 1e-6: # Small epsilon to check for near-constant values
         print(
             "Warning: Predicted depth values in the valid mask have near-zero variance. "
-            "Scale is ill-defined. Setting scale=1 and solving for shift only."
+            "Scale is ill-defined. Setting scale=1.0."
         )
         scale = 1.0
-        shift = np.mean(gt_masked) - np.mean(pred_masked) # or np.median(gt_masked) - np.median(pred_masked)
     else:
-        A = np.vstack([pred_masked, np.ones_like(pred_masked)]).T
+        # Only estimate scale: gt ≈ scale * pred
+        # Using least squares: scale = (pred * gt).sum() / (pred * pred).sum()
         try:
-            x, residuals, rank, s_values = np.linalg.lstsq(A, gt_masked, rcond=None)
-            scale, shift = x[0], x[1]
-        except np.linalg.LinAlgError as e:
-            print(f"Warning: Least squares alignment failed ({e}). Returning original prediction.")
-            return np.nan, np.nan, pred_depth.copy()
+            pred_squared_sum = np.sum(pred_masked * pred_masked)
+            if pred_squared_sum < 1e-10:
+                print("Warning: Sum of squared predicted values is too small. Setting scale=1.0.")
+                scale = 1.0
+            else:
+                scale = np.sum(pred_masked * gt_masked) / pred_squared_sum
+        except Exception as e:
+            print(f"Warning: Scale estimation failed ({e}). Setting scale=1.0.")
+            scale = 1.0
 
+    shift = 0.0  # No shift when only estimating scale
 
-    aligned_pred_depth = scale * pred_depth + shift
+    pred_masked_scaled = pred_masked * scale
+    diff = pred_masked_scaled - gt_masked
+    diff_squared = diff * diff
+
+    valid_mask = diff_squared < 100.0
+    gt_masked = gt_masked[valid_mask]
+    pred_masked = pred_masked[valid_mask]
+    pred_squared_sum = np.sum(pred_masked * pred_masked)
+    scale = np.sum(pred_masked * gt_masked) / pred_squared_sum
+
+    aligned_pred_depth = scale * pred_depth
+
+    # pred_masked_scaled = pred_depth * scale
+    # diff = pred_masked_scaled - gt_depth
+    # import matplotlib.pyplot as plt
+    # plt.imshow(diff, cmap="viridis")
+    # plt.show()
+
     return scale, shift, aligned_pred_depth
 
 
@@ -408,6 +402,67 @@ def calc_aligned_depth_filter_outliers(
         plt.close()
 
     return scale, shift, aligned_pred_depth, stats_dict
+
+def align_pred_gt_per_depth(
+    pred_depth: np.ndarray,
+    gt_depth: np.ndarray,
+    valid_mask: np.ndarray,
+    gt_extrinsics: np.ndarray,
+    gt_intrinsics: np.ndarray,
+    pred_extrinsic: np.ndarray,
+    pred_intrinsic: np.ndarray,
+    use_gt_extrinsic: bool = False,
+):
+    from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+    N = len(gt_extrinsics)
+
+    depth_scales = []
+    for i in range(N):
+        depth_scale, _, _ = align_pred_to_gt(
+            pred_depth=pred_depth[i],
+            gt_depth=gt_depth[i],
+            valid_mask=valid_mask[i],
+        )
+        depth_scales.append(depth_scale)
+
+
+    mean_scale = np.mean(depth_scales)
+    print(f"depth_scales: {depth_scales}, mean_scale: {mean_scale}")
+
+    aligned_pred_depths = pred_depth * mean_scale
+    pred_extrinsic[:, :, 3] = pred_extrinsic[:, :, 3] * mean_scale
+
+    aligned_pred_points = unproject_depth_map_to_point_map(
+        aligned_pred_depths,
+        gt_extrinsics if use_gt_extrinsic else pred_extrinsic,
+        gt_intrinsics if use_gt_extrinsic else pred_intrinsic,
+    )
+    aligned_pred_points_flat = aligned_pred_points.reshape(-1, 3)
+    aligned_pred_points_flat = aligned_pred_points_flat @ (
+        gt_extrinsics[0][:3, :3].T
+        if use_gt_extrinsic
+        else pred_extrinsic[0][:3, :3].T
+    ) + (gt_extrinsics[0][:3, 3] if use_gt_extrinsic else pred_extrinsic[0][:3, 3])
+    return aligned_pred_points_flat, mean_scale
+
+
+def align_pred_gt_by_pred_extrinsic(
+    pred_points_from_depth_flat: np.ndarray,
+    gt_extrinsics: np.ndarray,
+    pred_extrinsic: np.ndarray,
+):
+    scales = []
+    for i in range(1, len(gt_extrinsics)):
+        scales.append(
+            np.linalg.norm(gt_extrinsics[0][:3, 3] - gt_extrinsics[i][:3, 3])
+            / np.linalg.norm(pred_extrinsic[0][:3, 3] - pred_extrinsic[i][:3, 3])
+        )
+    print(f"extrinsic scales: {scales}")
+    mean_scale = np.mean(scales)
+    aligned_pred_points_flat = pred_points_from_depth_flat * mean_scale
+    return aligned_pred_points_flat, mean_scale
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Align predicted depth to ground truth depth")

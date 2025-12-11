@@ -287,7 +287,7 @@ def top_k_preserved_knockout(x: Tensor, num_images: int, num_patches_per_image: 
 
     x_reshaped = x[:, :, can_knockout_mask].reshape(B, H, num_patches_per_image*num_images, num_patches_per_image*num_images)
 
-    x_reshaped = x_reshaped.reshape(-1, 925)
+    x_reshaped = x_reshaped.reshape(-1, num_patches_per_image)
     top_k_values, top_k_indices = torch.topk(x_reshaped, k, dim=-1)
 
     x_reshaped.fill_(fill_value)
@@ -313,23 +313,6 @@ def top_k_preserved_knockout(x: Tensor, num_images: int, num_patches_per_image: 
     return x
 
 def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int, width: int, height: int, corres_masks: List[List[int]], fill_value: float = float('-inf')) -> Tensor:
-
-    # view_idx = 0
-    # token_idx = 100
-    # corres_valid_patch_idx = corres_masks[view_idx * 925 + token_idx]
-    # corres_mask_display = np.zeros([num_images, num_tokens_per_image_total * 14, num_tokens_per_image_total * 14])
-
-    # for i in corres_valid_patch_idx:
-    #     view_idx = i // 930
-    #     patch_idx = i % 930 - 5
-    #     patch_row = patch_idx // num_tokens_per_image_total
-    #     patch_col = patch_idx % num_tokens_per_image_total
-    #     corres_mask_display[view_idx, patch_row*14:patch_row*14+14, patch_col*14:patch_col*14+14] = 1
-    
-    # corres_mask_display = np.hstack([corres_mask_display[i] for i in range(num_images)])
-    # corres_mask_with_image = np.hstack([images[i] for i in range(num_images)])
-    # # apply mask
-    # corres_mask_with_image[corres_mask_display == 0] = 0
     debug_mode = False
     print("attention map mean before knockout: ", x.mean().item())
     print("attention map max before knockout: ", x.max().item())
@@ -356,7 +339,6 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
                 if len(valid_keys) > 0:
                     mask[valid_keys] = False
                 min_value = x[:, :, query_idx, :].min()
-                # x[:, :, query_idx, mask] = min_value
                 x[:, :, query_idx, mask] = fill_value
     
     if debug_mode:

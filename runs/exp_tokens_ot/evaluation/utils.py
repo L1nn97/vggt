@@ -1,9 +1,11 @@
 import os
 import sys
 import json
+import open3d as o3d
 from dataclasses import dataclass, field
 from typing import Tuple, List, Dict, Any
 from datetime import datetime
+import time
 
 import cv2
 import numpy as np
@@ -247,7 +249,6 @@ def calc_aligned_depth(
 
     return scale, shift, aligned_pred_depth, stats_dict
 
-
 def save_point_cloud_to_ply(points: np.ndarray, colors: np.ndarray, ply_path: str) -> None:
     """
     将点云保存为 PLY 格式文件。
@@ -455,3 +456,143 @@ def save_config_to_json(cfg: Any, json_path: str, additional_configs: Dict[str, 
         json.dump(data, f, indent=2, ensure_ascii=False)
     
     print(f"Configuration saved to {json_path}")
+
+def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
+    # Ensure point cloud size is not too large, which would cause slow computation
+    MAX_POINTS = 100000
+    if points_pred.shape[0] > MAX_POINTS:
+        np.random.seed(33)  # Fix random seed
+        indices = np.random.choice(points_pred.shape[0], MAX_POINTS, replace=False)
+        points_pred = points_pred[indices]
+
+    if points_gt.shape[0] > MAX_POINTS:
+        np.random.seed(33)  # Fix random seed
+        indices = np.random.choice(points_gt.shape[0], MAX_POINTS, replace=False)
+        points_gt = points_gt[indices]
+
+    # Convert numpy point clouds to open3d point cloud objects
+    pcd_pred = o3d.geometry.PointCloud()
+    pcd_gt = o3d.geometry.PointCloud()
+    pcd_pred.points = o3d.utility.Vector3dVector(points_pred)
+    pcd_gt.points = o3d.utility.Vector3dVector(points_gt)
+
+    # Downsample point clouds to accelerate computation
+    voxel_size = 0.05  # 5cm voxel size
+    pcd_pred = pcd_pred.voxel_down_sample(voxel_size)
+    pcd_gt = pcd_gt.voxel_down_sample(voxel_size)
+
+    # Compute distances from predicted point cloud to GT point cloud
+    distances1 = np.asarray(pcd_pred.compute_point_cloud_distance(pcd_gt))
+    # Compute distances from GT point cloud to predicted point cloud
+    distances2 = np.asarray(pcd_gt.compute_point_cloud_distance(pcd_pred))
+
+    # Apply distance clipping
+    distances1 = np.clip(distances1, 0, max_dist)
+    distances2 = np.clip(distances2, 0, max_dist)
+
+    # Chamfer Distance is the sum of mean distances in both directions
+    chamfer_dist = np.mean(distances1) + np.mean(distances2)
+
+    print(f"Chamfer Distance: {np.mean(distances1)}, {np.mean(distances2)}, {chamfer_dist}")
+
+    return chamfer_dist
+
+# Import umeyama_alignment for internal use in eval_trajectory
+def umeyama_alignment(src_points, dst_points, estimate_scale=True):
+    MAX_POINTS = 10000
+    if src_points.shape[0] > MAX_POINTS:
+        np.random.seed(33)  # Fix random seed
+        indices = np.random.choice(src_points.shape[0], MAX_POINTS, replace=False)
+        src = src_points[indices]
+
+    if dst_points.shape[0] > MAX_POINTS:
+        np.random.seed(33)  # Fix random seed
+        indices = np.random.choice(dst_points.shape[0], MAX_POINTS, replace=False)
+        dst = dst_points[indices]
+
+    # Compute centroids
+    src_mean = src.mean(axis=1, keepdims=True)
+    dst_mean = dst.mean(axis=1, keepdims=True)
+
+    # Center the point clouds
+    src_centered = src - src_mean
+    dst_centered = dst - dst_mean
+
+    # Compute covariance matrix
+    cov = dst_centered @ src_centered.T
+
+    try:
+        # Singular Value Decomposition
+        U, D, Vt = svd(cov)
+        V = Vt.T
+
+        # Handle reflection case
+        det_UV = np.linalg.det(U @ V.T)
+        S = np.eye(3)
+        if det_UV < 0:
+            S[2, 2] = -1
+
+        # Compute rotation matrix
+        R = U @ S @ V.T
+
+        if estimate_scale:
+            # Compute scale factor - fix dimension issue
+            src_var = np.sum(src_centered * src_centered)
+            if src_var < 1e-10:
+                print(
+                    "Warning: Source point cloud variance close to zero, setting scale factor to 1.0"
+                )
+                scale = 1.0
+            else:
+                # Fix potential dimension issue with np.diag(S)
+                # Use diagonal elements directly
+                scale = np.sum(D * np.diag(S)) / src_var
+        else:
+            scale = 1.0
+
+        # Compute translation vector
+        t = dst_mean.ravel() - scale * (R @ src_mean).ravel()
+
+        return scale, R, t
+
+    except Exception as e:
+        print(f"Error in umeyama_alignment computation: {e}")
+        print(
+            "Returning default transformation: scale=1.0, rotation=identity matrix, translation=centroid difference"
+        )
+        # Return default transformation
+        scale = 1.0
+        R = np.eye(3)
+        t = (dst_mean - src_mean).ravel()
+        return scale, R, 
+
+def align_point_clouds_scale(source_pc, target_pc):
+    # Compute bounding box sizes of point clouds
+    source_min = np.min(source_pc, axis=0)
+    source_max = np.max(source_pc, axis=0)
+    target_min = np.min(target_pc, axis=0)
+    target_max = np.max(target_pc, axis=0)
+
+    source_size = source_max - source_min
+    target_size = target_max - target_min
+
+    # Compute point cloud centers
+    source_center = (source_max + source_min) / 2
+    target_center = (target_max + target_min) / 2
+
+    # Compute overall scale factor (using diagonal length)
+    source_diag = np.sqrt(np.sum(source_size**2))
+    target_diag = np.sqrt(np.sum(target_size**2))
+
+    if source_diag < 1e-8:
+        print("Warning: Source point cloud size close to zero")
+        scale_factor = 1.0
+    else:
+        scale_factor = target_diag / source_diag
+
+    # Apply scaling (with source point cloud center as reference)
+    centered_source = source_pc - source_center
+    scaled_centered = centered_source * scale_factor
+    scaled_aligned_source = scaled_centered + target_center
+
+    return scaled_aligned_source, scale_factor

@@ -196,7 +196,6 @@ def compute_pairwise_relative_errors(
         print(f"  最大值: {np.max(rta_errors):.6f}")
         print(f"  最小值: {np.min(rta_errors):.6f}")
         
-        print("=" * 60)
     
     return {
         "rra": rra_errors,  # 相对旋转角度误差
