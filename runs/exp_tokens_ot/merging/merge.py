@@ -253,7 +253,7 @@ def token_merge_bipartite2d(
             protected_mask_src = torch.isin(src_indices, protected_indices)
             edge_flat = edge_idx[0, :, 0]
             valid_mask = ~protected_mask_src[edge_flat]
-            valid_edges = edge_flat[valid_mask]
+            valid_edges = edge_flat[valid_mask] # 没被protected 的src tokens的索引
 
             valid_count = valid_edges.shape[0]
             r_actual = min(r, valid_count)
@@ -388,4 +388,4 @@ def token_merge_bipartite2d(
 
         return out
 
-    return merge, unmerge
+    return merge, unmerge, unm_idx, src_idx, dst_idx, a_idx, b_idx, protected_idx

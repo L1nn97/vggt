@@ -148,10 +148,23 @@ class TokenFusionStrategyConfig:
     target_size: Tuple[int, int] = (518, 350)
     patch_size: int = 14
     special_tokens_num: int = 5
+    # for attention knockout
     knockout_layer_idx: list[int] = field(default_factory=lambda: [-1])
     knockout_method: str = "random" # "random" or "visible_score" or "top_k"
     knockout_random_ratio: float = 0.5
     knockout_top_k: int = 100
+    # for token merge
+    enable_token_merge: bool = False
+    token_merge_ratio: float = 0.5
+    sx: int = 5
+    sy: int = 5
+    no_rand: bool = False
+    enable_protection: bool = True
+    # debug options
+    calculate_rope_gain_ratio: bool = False
+    calculate_token_cos_similarity: bool = False
+    display_attn_map_after_softmax: bool = False
+    calculate_top_k_dominance: bool = False
 
 class TokenFusionStrategy:
     def __init__(self, args):
@@ -183,8 +196,6 @@ class TokenFusionStrategy:
         self.num_tokens_per_image_on_height = self.height // self.patch_size
         self.num_tokens_per_image = self.num_tokens_per_image_on_width * self.num_tokens_per_image_on_height
 
-
-
         # 加载数据
         self.images = []
         self.depths = []    
@@ -211,16 +222,28 @@ class TokenFusionStrategy:
         # for top-k preserved knockout      
         self.knockout_top_k = get_arg('knockout_top_k')
 
+        self.enable_token_merge = get_arg('enable_token_merge')
+        self.token_merge_ratio = get_arg('token_merge_ratio')
+        self.sx = get_arg('sx')
+        self.sy = get_arg('sy')
+        self.no_rand = get_arg('no_rand')
+        self.enable_protection = get_arg('enable_protection')
+        self.merge_fn, self.unmerge_fn = None, None
+        self.unm_idx, self.src_idx, self.dst_idx, self.a_idx, self.b_idx, self.protected_idx = None, None, None, None, None, None
+
         # for observe token sparsity
+        self.calculate_token_cos_similarity = get_arg('calculate_token_cos_similarity')
         self.x_cos_similarity = []
         self.tokens_erank_kernel_norm = []
         self.tokens_erank_fro_norm = []
 
         # for rope gain calculation 
+        self.calculate_rope_gain_ratio = get_arg('calculate_rope_gain_ratio')
         self.q_original = []
         self.q_rope_gain = []
 
         # for top-k dominance of global attention after softmax calculation
+        self.calc_top_k_dominance = get_arg('calculate_top_k_dominance')
         self.top_k_dominance = []
 
         # for attention rollout calculation
@@ -229,70 +252,98 @@ class TokenFusionStrategy:
         # for percise corresponding attention knockout
         self.corres_masks = self.calculate_corresponding_attention_mask()
 
+        # for display attention map after softmax
+        self.display_attn_map_after_softmax = get_arg('display_attn_map_after_softmax')
         self.attention_of_all_heads = []
 
         self.token_cosine_similarity = []
 
 
-    def calculate_token_cos_similarity(self, x: Tensor, curr_layer_idx: int):
-        def matrix_norms(tokens):
-            U, S, Vh = torch.linalg.svd(tokens, full_matrices=False)  # S shape: (B, min(N,C))
-            spectral = S[..., 0]
-            knl = S.sum(dim=-1)
-            fro = torch.linalg.norm(tokens)  # 更快，不必用奇异值
-            return spectral, knl, fro
+    def rope(self, rope, q, k, pos):
+        """
+        给rope的计算套了一层壳， 为了把计算rope gain的逻辑封装起来
+        """
+        def calculate_rope_gain(q_original: Tensor, q_rope: Tensor):
+            norm_q_diff = torch.norm(q_rope - q_original, p=2, dim=-1).mean()
+            norm_q_original = torch.norm(q_original, p=2, dim=-1).mean()
+            norm_q_diff_ratio = norm_q_diff / norm_q_original
 
-        D = x.shape[-1]
-        x_normed = x.reshape(-1, D).clone()
-        N = x_normed.shape[0]
+            self.q_original.append(norm_q_original.item())
+            self.q_rope_gain.append(norm_q_diff_ratio.item())
 
-        spectral, knl, fro = matrix_norms(x_normed)
-        x_normed /= x_normed.norm(dim=-1, keepdim=True)
-        # cos_sim = torch.abs(torch.mm(x_normed, x_normed.t())) # 这里取不取abs有一些影响但是不大
-        cos_sim = torch.mm(x_normed, x_normed.t())
-        # plt.imshow(cos_sim.cpu().numpy())
-        # plt.colorbar()
-        # plt.show()
-        cos_sim_mean = cos_sim.mean().item()
+        if self.calculate_rope_gain_ratio:
+            q_original = q.clone()
 
-        self.tokens_erank_kernel_norm.append(knl.item() / (N *spectral.item()))
-        self.tokens_erank_fro_norm.append(fro.item() / (N * spectral.item()))
-        self.x_cos_similarity.append(cos_sim_mean)
-        del x_normed, cos_sim
+        q = rope(q, pos)
+        k = rope(k, pos)
 
-    def visualize_token_similarity_heatmap(self, x:Tensor, token_idx: int, image_idx: int):
-        D = x.shape[-1]
-        x_normed = x.reshape(-1, D).clone() 
-        x_normed /= x_normed.norm(dim=-1, keepdim=True)
-        cos_sim = torch.mm(x_normed, x_normed.t())
+        if self.calculate_rope_gain_ratio:
+            calculate_rope_gain(q_original, q)
+            del q_original
+        return q, k
 
-        similarity_heatmaps = []
-        for token_idx_i in token_idx:
-            for image_idx_i in image_idx:
-                cos_sim_fp32 = cos_sim.float()
-                similarity_heatmap = cos_sim_fp32[token_idx_i, image_idx_i * (self.num_tokens_per_image + 5) : (image_idx_i + 1) * (self.num_tokens_per_image + 5)][5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width)
-                similarity_heatmap = cv2.resize(similarity_heatmap, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-                blended_image = apply_heatmap(self.images[image_idx_i], similarity_heatmap, alpha = 0.8)
-                similarity_heatmaps.append(blended_image)
+    def inspect_token_similarity(self, x: Tensor):
+        if not self.calculate_token_cos_similarity:
+            return
+        def calculate_token_cos_similarity(x: Tensor):
+            def matrix_norms(tokens):
+                U, S, Vh = torch.linalg.svd(tokens, full_matrices=False)  # S shape: (B, min(N,C))
+                spectral = S[..., 0]
+                knl = S.sum(dim=-1)
+                fro = torch.linalg.norm(tokens)  # 更快，不必用奇异值
+                return spectral, knl, fro
 
-        # plot by grid concat
-        grid_img = np.concatenate([np.concatenate(similarity_heatmaps[i*len(image_idx):(i+1)*len(image_idx)], axis=1) for i in range(len(token_idx))], axis=1)
-        self.token_cosine_similarity.append(grid_img)
+            D = x.shape[-1]
+            x_normed = x.reshape(-1, D).clone()
+            N = x_normed.shape[0]
 
-        # plt.imshow(grid_img)
-        # plt.colorbar()
-        # plt.show()
-        
+            spectral, knl, fro = matrix_norms(x_normed)
+            x_normed /= x_normed.norm(dim=-1, keepdim=True)
+            # cos_sim = torch.abs(torch.mm(x_normed, x_normed.t())) # 这里取不取abs有一些影响但是不大
+            cos_sim = torch.mm(x_normed, x_normed.t())
+            # plt.imshow(cos_sim.cpu().numpy())
+            # plt.colorbar()
+            # plt.show()
+            cos_sim_mean = cos_sim.mean().item()
 
-    def calculate_rope_gain(self, q_original: Tensor, q_rope: Tensor):
-        norm_q_diff = torch.norm(q_rope - q_original, p=2, dim=-1).mean()
-        norm_q_original = torch.norm(q_original, p=2, dim=-1).mean()
-        norm_q_diff_ratio = norm_q_diff / norm_q_original
+            self.tokens_erank_kernel_norm.append(knl.item() / (N *spectral.item()))
+            self.tokens_erank_fro_norm.append(fro.item() / (N * spectral.item()))
+            self.x_cos_similarity.append(cos_sim_mean)
+            del x_normed, cos_sim
 
-        self.q_original.append(norm_q_original.item())
-        self.q_rope_gain.append(norm_q_diff_ratio.item())
+        def visualize_token_similarity_heatmap(x:Tensor, token_idx: int, image_idx: int):
+            D = x.shape[-1]
+            x_normed = x.reshape(-1, D).clone() 
+            x_normed /= x_normed.norm(dim=-1, keepdim=True)
+            cos_sim = torch.mm(x_normed, x_normed.t())
+            cos_sim_fp32 = cos_sim.float()
+
+            random_token_idx = np.random.uniform(0, self.num_tokens_per_image + self.special_tokens_num, size=(50,)).astype(np.int32)
+
+            mean_similarity = np.zeros(len(image_idx), dtype=np.float32)
+            for token_idx_i in random_token_idx:
+                for image_idx_i in image_idx:
+                    similarity_heatmap = cos_sim_fp32[token_idx_i, image_idx_i * (self.num_tokens_per_image + 5) : (image_idx_i + 1) * (self.num_tokens_per_image + 5)][5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width)
+                    mean_similarity[image_idx_i] = mean_similarity[image_idx_i] + similarity_heatmap.max().item()
+
+            print(f"mean similarity: {mean_similarity}")
+
+            similarity_heatmaps = []
+            for token_idx_i in token_idx:
+                for image_idx_i in image_idx:
+                    similarity_heatmap = cos_sim_fp32[token_idx_i, image_idx_i * (self.num_tokens_per_image + 5) : (image_idx_i + 1) * (self.num_tokens_per_image + 5)][5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width)
+                    similarity_heatmaps.append(similarity_heatmap)
+
+            # plot by grid concat
+            grid_img = np.concatenate([np.concatenate(similarity_heatmaps[i*len(image_idx):(i+1)*len(image_idx)], axis=1) for i in range(len(token_idx))], axis=1)
+            self.token_cosine_similarity.append(grid_img)
+
+        calculate_token_cos_similarity(x)
+        visualize_token_similarity_heatmap(x, [491+5, 794+5], [0, 1, 2, 3])
 
     def calculate_top_k_dominance(self, attn_map: Tensor, threshold: float = 0.9):
+        if not self.calc_top_k_dominance:
+            return
         def compute_topk_dominance(attention_map, threshold=0.9):
             """
             attention_map: [1, H, N, K] 或 [H, N, K]
@@ -392,6 +443,8 @@ class TokenFusionStrategy:
                 # self.token_weighter.visualize_attn_map(attn_after_softmax, [0, 500, 930, 1430], [0, 1, 2])
 
         """
+        if self.enable_token_merge or not self.display_attn_map_after_softmax:
+            return
         def get_attn_map(attn_map: Tensor, token_idx: int, image_idx: int, head: int):
             if token_idx > self.num_views * (self.num_tokens_per_image + self.special_tokens_num) or image_idx > self.num_views - 1:
                 print(f"token_idx: {token_idx} or image_idx: {image_idx} is out of range")
@@ -422,7 +475,6 @@ class TokenFusionStrategy:
         # plot by grid concat
         grid_img = np.concatenate(target_attn_maps, axis=1)
         self.attention_of_all_heads.append(grid_img)
-
 
     def calculate_visible_mask(self, attn_map: Tensor, src_patch_idx: Tuple[int, int], src_view_idx: int, tgt_view_idx: int) -> np.ndarray:
         image_0, depth_0, mask_0, world_coords_0, intrinsic_0, extrinsic_0 = self.images[src_view_idx], self.depths[src_view_idx], self.masks[src_view_idx], self.world_coords[src_view_idx], self.intrinsics[src_view_idx], self.extrinsics[src_view_idx]
@@ -593,6 +645,8 @@ class TokenFusionStrategy:
         return visible_scores
 
     def attention_knockout(self, attn_map: Tensor, curr_layer_idx: int) -> Tensor:
+        if self.enable_token_merge:
+            return attn_map
         if curr_layer_idx not in self.knockout_layer_idx and -1 not in self.knockout_layer_idx:
             return attn_map
 
@@ -613,11 +667,73 @@ class TokenFusionStrategy:
         else:
             raise ValueError(f"Invalid knockout method: {self.knockout_method}")
 
-    def get_token_merge_fn(self, attn_map: Tensor, x_step: int, y_step: int, merge_ratio: float, ) -> Tuple[Callable, Callable]:
-        generator = torch.Generator(device=attn_map.device)
+    def token_merge_FastVGGT(self, x, q, k, v):
+        if not self.enable_token_merge:
+            return q, k, v
+        generator = torch.Generator(device=x.device)
         generator.manual_seed(33)
-        r = attn_map.shape[1] * merge_ratio
-        return token_merge_bipartite2d(attn_map, self.width // self.patch_size, self.height// self.patch_size, x_step, y_step, r, False, generator, True)
+
+        r = int(x.shape[1] * self.token_merge_ratio)
+
+        (self.merge_fn, self.unmerge_fn, self.unm_idx, self.src_idx, self.dst_idx, self.a_idx, self.b_idx, self.protected_idx) = token_merge_bipartite2d(
+            x,
+            self.num_tokens_per_image_on_width,
+            self.num_tokens_per_image_on_height,
+            self.sx,
+            self.sy,
+            r,
+            no_rand=self.no_rand,
+            generator=generator,
+            enable_protection=self.enable_protection,
+        )
+
+        B_q, H_q, N_q, D_q = q.shape
+
+        q_merge_in = q.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q) # (B, N, H * D)
+        k_merge_in = k.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+        v_merge_in = v.permute(0, 2, 1, 3).reshape(B_q, N_q, H_q * D_q)
+
+        q_out, k_out, v_out = self.merge_fn(
+            q_merge_in,
+            mode="mean",
+            extra_tensors=k_merge_in,
+            extra_tensors_2=v_merge_in,
+        )
+
+        del q_merge_in, k_merge_in, v_merge_in
+
+        N_m = q_out.shape[1]
+        q = q_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+        k = k_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+        v = v_out.reshape(B_q, N_m, H_q, D_q).permute(0, 2, 1, 3)
+
+        del q_out, k_out, v_out
+
+        return q, k, v
+
+    def token_unmerge_FastVGGT(self, x):
+        if self.unmerge_fn is None:
+            return x
+        return self.unmerge_fn(x)
+
+    def who_are_merged(self):
+        if self.src_idx is None:
+            pass
+        N = (self.num_tokens_per_image + self.special_tokens_num) * self.num_views
+        merged_map = torch.zeros(N)
+
+        merged_idx = torch.gather(self.a_idx, dim=1, index=self.src_idx)[0, :, 0]
+        # merged_idx = torch.gather(self.b_idx, dim=1, index=self.dst_idx)[0, :, 0]
+        merged_map[merged_idx.cpu()] = 1
+        merge_map_display = []
+        for i in range(self.num_views):
+            merge_map_display.append(merged_map[self.special_tokens_num + (self.special_tokens_num + self.num_tokens_per_image) * i: (self.special_tokens_num + self.num_tokens_per_image) * (i + 1)].reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width).numpy())
+        merge_map_display = np.concatenate(merge_map_display, axis=1)
+        plt.imshow(merge_map_display)
+        plt.title("Merged map")
+        plt.show()
+        return merge_map_display
+
 
 if __name__ == "__main__":
     def run() -> None:

@@ -8,7 +8,6 @@ from datetime import datetime
 import cv2
 import numpy as np
 import torch
-import imageio
 import matplotlib.pyplot as plt
 
 np.set_printoptions(threshold=np.inf)
@@ -19,14 +18,8 @@ from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.layers.token_weighter import TokenFusionStrategy, TokenFusionStrategyConfig
-from eval.criterion import Regr3D_t_ScaleShiftInv, L21
-from vggt.utils.geometry import depth_to_world_coords_points, depth_to_cam_coords_points
-from evaluation.depth_estimation import (
-    calculate_depth_error,
-    align_pred_to_gt,
-    align_pred_gt_per_depth,
-    align_pred_gt_by_pred_extrinsic,
-)
+from evaluation.depth_estimation import align_pred_gt_per_depth
+
 from evaluation.pose_estimation import (
     compute_pairwise_relative_errors,
     convert_poses_to_4x4,
@@ -85,6 +78,19 @@ class VGGTReconstructConfig:
     knockout_random_ratio: float = 0.1
     knockout_top_k: int = 100
 
+    # token merge 配置
+    enable_token_merge: bool = False
+    token_merge_ratio: float = 0.2
+    sx: int = 5
+    sy: int = 5
+    no_rand: bool = False
+    enable_protection: bool = True
+
+    # debug options
+    calculate_rope_gain_ratio: bool = False
+    calculate_token_cos_similarity: bool = False
+    display_attn_map_after_softmax: bool = False
+    calculate_top_k_dominance: bool = False
 
 # 这一段代码是为了获取示例图像，用于测试###################################################
 import glob
@@ -134,13 +140,27 @@ if __name__ == "__main__":
         use_conf_filter=False,
         conf_percentile=30.0,
         max_depth_diff=50.0,
-        knockout_layer_idx=range(0, 5, 1),
-        # knockout_layer_idx=[],
+        # knockout_layer_idx=range(0, 5, 1),
+        knockout_layer_idx=[],
         knockout_method="corres_mask",
         knockout_random_ratio=0.5,
         knockout_top_k=100,
         use_local_display=True,
         save_results=False,
+
+        # FastVGGT token merge options
+        enable_token_merge=True,
+        token_merge_ratio=0.5,
+        sx=5,
+        sy=5,
+        no_rand = True,
+        enable_protection = False,
+
+        # debug options
+        calculate_rope_gain_ratio=False,
+        calculate_token_cos_similarity = False,
+        display_attn_map_after_softmax = False,
+        calculate_top_k_dominance = False,
     )
 
     token_fusion_strategy_cfg = TokenFusionStrategyConfig(
@@ -156,6 +176,20 @@ if __name__ == "__main__":
         knockout_method=cfg.knockout_method,
         knockout_random_ratio=cfg.knockout_random_ratio,
         knockout_top_k=cfg.knockout_top_k,
+
+        # FastVGGT token merge options
+        enable_token_merge=cfg.enable_token_merge,
+        token_merge_ratio=cfg.token_merge_ratio,
+        sx=cfg.sx,
+        sy=cfg.sy,
+        no_rand=cfg.no_rand,
+        enable_protection=cfg.enable_protection,
+
+        # debug options
+        calculate_rope_gain_ratio=cfg.calculate_rope_gain_ratio,
+        calculate_token_cos_similarity=cfg.calculate_token_cos_similarity,
+        display_attn_map_after_softmax=cfg.display_attn_map_after_softmax,
+        calculate_top_k_dominance=cfg.calculate_top_k_dominance,
     )
 
     token_weighter = TokenFusionStrategy(token_fusion_strategy_cfg)
