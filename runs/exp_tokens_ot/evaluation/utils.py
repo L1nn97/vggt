@@ -457,7 +457,30 @@ def save_config_to_json(cfg: Any, json_path: str, additional_configs: Dict[str, 
     
     print(f"Configuration saved to {json_path}")
 
-def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
+def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0, display_outliner = False):
+    # Filter out NaN and Inf values from point clouds
+    valid_mask_pred = np.isfinite(points_pred).all(axis=1)
+    valid_mask_gt = np.isfinite(points_gt).all(axis=1)
+    
+    nan_count_pred = np.sum(~valid_mask_pred)
+    nan_count_gt = np.sum(~valid_mask_gt)
+    
+    if nan_count_pred > 0:
+        print(f"[compute_chamfer_distance] WARNING: Found {nan_count_pred} NaN/Inf points in pred, filtering them out")
+        points_pred = points_pred[valid_mask_pred]
+    
+    if nan_count_gt > 0:
+        print(f"[compute_chamfer_distance] WARNING: Found {nan_count_gt} NaN/Inf points in gt, filtering them out")
+        points_gt = points_gt[valid_mask_gt]
+    
+    if len(points_pred) == 0:
+        print(f"[compute_chamfer_distance] ERROR: No valid points in pred after filtering!")
+        return np.nan
+    
+    if len(points_gt) == 0:
+        print(f"[compute_chamfer_distance] ERROR: No valid points in gt after filtering!")
+        return np.nan
+    
     # Ensure point cloud size is not too large, which would cause slow computation
     MAX_POINTS = 100000
     if points_pred.shape[0] > MAX_POINTS:
@@ -485,17 +508,87 @@ def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0):
     distances1 = np.asarray(pcd_pred.compute_point_cloud_distance(pcd_gt))
     # Compute distances from GT point cloud to predicted point cloud
     distances2 = np.asarray(pcd_gt.compute_point_cloud_distance(pcd_pred))
+    
+    # Check for NaN in computed distances
+    nan_dist1 = np.sum(~np.isfinite(distances1))
+    nan_dist2 = np.sum(~np.isfinite(distances2))
+    if nan_dist1 > 0:
+        print(f"[compute_chamfer_distance] WARNING: Found {nan_dist1} NaN/Inf in distances1, replacing with max_dist")
+        distances1 = np.nan_to_num(distances1, nan=max_dist, posinf=max_dist, neginf=max_dist)
+    if nan_dist2 > 0:
+        print(f"[compute_chamfer_distance] WARNING: Found {nan_dist2} NaN/Inf in distances2, replacing with max_dist")
+        distances2 = np.nan_to_num(distances2, nan=max_dist, posinf=max_dist, neginf=max_dist)
+    
+    # Statistics for distances1 (pred -> gt)
+    mask1 = distances1 > max_dist
+    count1 = np.sum(mask1)
+    if count1 > 0:
+        mean_error1 = np.mean(distances1[mask1])
+        print(f"distances1 (pred->gt): {count1} points exceed max_dist={max_dist}, mean error: {mean_error1:.4f}")
+    else:
+        print(f"distances1 (pred->gt): all {len(distances1)} points are within max_dist={max_dist}")
+
+    # Statistics for distances2 (gt -> pred)
+    mask2 = distances2 > max_dist
+    count2 = np.sum(mask2)
+    if count2 > 0:
+        mean_error2 = np.mean(distances2[mask2])
+        print(f"distances2 (gt->pred): {count2} points exceed max_dist={max_dist}, mean error: {mean_error2:.4f}")
+    else:
+        print(f"distances2 (gt->pred): all {len(distances2)} points are within max_dist={max_dist}")
+
+    if display_outliner:
+        # 绘制大于误差限的点云（距离大于max_dist的点）
+        # 可视化 pred->gt 误差大于max_dist的点（红色）以及全部点（灰色）
+        if np.sum(mask1) > 0:
+            # 大于max_dist的预测点
+            error_points_pred = np.asarray(pcd_pred.points)[mask1]
+            pcd_err_pred = o3d.geometry.PointCloud()
+            pcd_err_pred.points = o3d.utility.Vector3dVector(error_points_pred)
+            pcd_err_pred.paint_uniform_color([1, 0, 0])  # 红色
+
+            # 其余全部预测点（浅灰）
+            all_points_pred = np.asarray(pcd_pred.points)
+            valid_points_pred = all_points_pred[~mask1]
+            pcd_valid_pred = o3d.geometry.PointCloud()
+            pcd_valid_pred.points = o3d.utility.Vector3dVector(valid_points_pred)
+            pcd_valid_pred.paint_uniform_color([0.6, 0.6, 0.6])  # 灰色
+
+            # GT点云
+            pcd_gt.paint_uniform_color([0, 1, 0])  # 绿色
+
+            o3d.visualization.draw_geometries([pcd_err_pred, pcd_valid_pred], window_name="预测点云超限(红)+GT(绿)")
+
+        # 可视化 gt->pred 误差大于max_dist的GT点（蓝色）
+        if np.sum(mask2) > 0:
+            error_points_gt = np.asarray(pcd_gt.points)[mask2]
+            pcd_err_gt = o3d.geometry.PointCloud()
+            pcd_err_gt.points = o3d.utility.Vector3dVector(error_points_gt)
+            pcd_err_gt.paint_uniform_color([0, 0, 1])  # 蓝色
+
+            # 其余全部GT点（浅灰）
+            all_points_gt = np.asarray(pcd_gt.points)
+            valid_points_gt = all_points_gt[~mask2]
+            pcd_valid_gt = o3d.geometry.PointCloud()
+            pcd_valid_gt.points = o3d.utility.Vector3dVector(valid_points_gt)
+            pcd_valid_gt.paint_uniform_color([0.6, 0.6, 0.6])  # 灰色
+
+            # 预测点云
+            pcd_pred.paint_uniform_color([1, 0.647, 0])  # 橙色
+
+            o3d.visualization.draw_geometries([pcd_err_gt, pcd_valid_gt], window_name="GT点云超限(蓝)+预测点云(橙)")
+
 
     # Apply distance clipping
     distances1 = np.clip(distances1, 0, max_dist)
     distances2 = np.clip(distances2, 0, max_dist)
 
     # Chamfer Distance is the sum of mean distances in both directions
-    chamfer_dist = np.mean(distances1) + np.mean(distances2)
+    chamfer_dist = (np.mean(distances1) + np.mean(distances2)) / 2.0
 
     print(f"Chamfer Distance: {np.mean(distances1)}, {np.mean(distances2)}, {chamfer_dist}")
 
-    return chamfer_dist
+    return chamfer_dist 
 
 # Import umeyama_alignment for internal use in eval_trajectory
 def umeyama_alignment(src_points, dst_points, estimate_scale=True):

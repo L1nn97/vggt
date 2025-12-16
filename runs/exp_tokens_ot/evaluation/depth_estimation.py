@@ -39,8 +39,92 @@ def calculate_depth_error(
 
     return per_view_scale
 
-
 def align_pred_to_gt(
+    pred_depth: np.ndarray,
+    gt_depth: np.ndarray,
+    valid_mask: np.ndarray,
+    min_valid_pixels: int = 100,
+) -> tuple[float, float, np.ndarray]:
+    """
+    Aligns a predicted depth map to a ground truth depth map using scale and shift.
+    The alignment is: gt_aligned_to_pred ≈ scale * pred_depth + shift.
+
+    Args:
+        pred_depth (np.ndarray): The HxW predicted depth map.
+        gt_depth (np.ndarray): The HxW ground truth depth map.
+        min_gt_depth (float): Minimum valid depth value for GT.
+        max_gt_depth (float): Maximum valid depth value for GT.
+        min_pred_depth (float): Minimum valid depth value for predictions.
+        min_valid_pixels (int): Minimum number of valid overlapping pixels
+                                 required to perform the alignment.
+        robust_median_scale (bool): If True, uses median(gt/pred) for scale and then
+                                    median(gt - scale*pred) for shift. Otherwise, uses
+                                    least squares for both scale and shift simultaneously.
+
+    Returns:
+        tuple[float, float, np.ndarray]:
+            - scale (float): The calculated scale factor. (NaN if alignment failed)
+            - shift (float): The calculated shift offset. (NaN if alignment failed)
+            - aligned_pred_depth (np.ndarray): The HxW predicted depth map after
+                                               applying scale and shift. (Original pred_depth
+                                               if alignment failed)
+    """
+    if pred_depth.shape != gt_depth.shape:
+        raise ValueError(
+            f"Predicted depth shape {pred_depth.shape} must match GT depth shape {gt_depth.shape}"
+        )
+
+    # Extract valid depth values
+    gt_masked = gt_depth[valid_mask]
+    pred_masked = pred_depth[valid_mask]
+
+    if len(gt_masked) < min_valid_pixels:
+        print(
+            f"Warning: Not enough valid pixels ({len(gt_masked)} < {min_valid_pixels}) to align. "
+            "Using all pixels."
+        )
+        gt_masked = gt_depth.reshape(-1)
+        pred_masked = pred_depth.reshape(-1)
+
+
+    # Handle case where pred_masked has no variance (e.g., all zeros or a constant value)
+    if np.std(pred_masked) < 1e-6: # Small epsilon to check for near-constant values
+        print(
+            "Warning: Predicted depth values in the valid mask have near-zero variance. "
+            "Scale is ill-defined. Setting scale=1 and solving for shift only."
+        )
+        scale = 1.0
+        shift = np.mean(gt_masked) - np.mean(pred_masked) # or np.median(gt_masked) - np.median(pred_masked)
+    else:
+        A = np.vstack([pred_masked, np.ones_like(pred_masked)]).T
+        try:
+            x, residuals, rank, s_values = np.linalg.lstsq(A, gt_masked, rcond=None)
+            scale, shift = x[0], x[1]
+        except np.linalg.LinAlgError as e:
+            print(f"Warning: Least squares alignment failed ({e}). Returning original prediction.")
+            return np.nan, np.nan, pred_depth.copy()
+
+
+    aligned_pred_depth = scale * pred_depth + shift
+    return scale, shift, aligned_pred_depth
+
+#   valid_mask = torch.logical_and(
+#       gt_depth.squeeze().cpu() > 1e-3,     # filter out black background
+#       predictions["depth_conf"].squeeze().cpu() > args.depth_conf_thres
+#   )
+#   valid_mask = valid_mask.numpy()[0]  # Take first item in batch
+  
+
+#   align_mask = valid_mask.copy()
+  
+#   scale, shift, aligned_pred_depth = align_pred_to_gt(
+#       depth_map.squeeze()[0].cpu().numpy(), 
+#       gt_depth.squeeze()[0].cpu().numpy(), 
+#       align_mask
+#   )
+
+
+def align_pred_to_gt_without_shift(
     pred_depth: np.ndarray,
     gt_depth: np.ndarray,
     valid_mask: np.ndarray,
@@ -159,7 +243,7 @@ def calc_aligned_depth_filter_outliers(
         gt_mask = gt_mask.cpu().numpy()
 
     # 对齐预测深度到GT
-    scale, shift, aligned_pred_depth = align_pred_to_gt(
+    scale, shift, aligned_pred_depth = align_pred_to_gt_without_shift(
         pred_depth, gt_depth, gt_mask, 100
     )
 
@@ -403,6 +487,22 @@ def calc_aligned_depth_filter_outliers(
 
     return scale, shift, aligned_pred_depth, stats_dict
 
+def calculate_depth_scales(
+    pred_depth: np.ndarray,
+    gt_depth: np.ndarray,
+    valid_mask: np.ndarray,
+):
+    scales = []
+    N = pred_depth.shape[0]
+    for i in range(N):
+        scale, _, _ = align_pred_to_gt_without_shift(
+            pred_depth=pred_depth[i],
+            gt_depth=gt_depth[i],
+            valid_mask=valid_mask[i],
+        )
+        scales.append(scale)
+    return scales
+
 def align_pred_gt_per_depth(
     pred_depth: np.ndarray,
     gt_depth: np.ndarray,
@@ -419,7 +519,7 @@ def align_pred_gt_per_depth(
 
     depth_scales = []
     for i in range(N):
-        depth_scale, _, _ = align_pred_to_gt(
+        depth_scale, _, _ = align_pred_to_gt_without_shift(
             pred_depth=pred_depth[i],
             gt_depth=gt_depth[i],
             valid_mask=valid_mask[i],
@@ -506,7 +606,7 @@ if __name__ == "__main__":
         valid_mask = gt_depth > 1e-3
     
     # 执行对齐
-    scale, shift, aligned_pred_depth = align_pred_to_gt(pred_depth, gt_depth, valid_mask)
+    scale, shift, aligned_pred_depth = align_pred_to_gt_without_shift(pred_depth, gt_depth, valid_mask)
     
     print(f"Scale: {scale:.6f}")
     print(f"Shift: {shift:.6f}")

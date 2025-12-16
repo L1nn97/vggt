@@ -18,12 +18,14 @@ from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.layers.token_weighter import TokenFusionStrategy, TokenFusionStrategyConfig
-from evaluation.depth_estimation import align_pred_gt_per_depth
+from evaluation.depth_estimation import align_pred_gt_per_depth, align_pred_to_gt_without_shift
 
 from evaluation.pose_estimation import (
     compute_pairwise_relative_errors,
     convert_poses_to_4x4,
 )
+
+from evaluation.pointmap_estimation import umeyama_alignment
 import json
 
 from evaluation.utils import *
@@ -88,6 +90,10 @@ class VGGTReconstructConfig:
     display_attn_map_after_softmax: bool = False
     calculate_top_k_dominance: bool = False
 
+    # evaluation options
+    use_stat_filter: bool = False
+    use_icp_alignment: bool = False
+
 # 这一段代码是为了获取示例图像，用于测试###################################################
 import glob
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -115,56 +121,119 @@ def get_example_images(
 ###################################################################################
 
 if __name__ == "__main__":
+    
+    import argparse
+    import sys
 
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError('Boolean value expected.')
+        
+    parser = argparse.ArgumentParser(description="VGGT Reconstruction Experimental Runner")
+
+    parser.add_argument('--device', type=str, default="cuda")
+    parser.add_argument('--dtype', type=str, default="torch.float16", help="torch.float16, torch.bfloat16, etc")
+    
+    parser.add_argument('--checkpoint_path', type=str, default="/home/vision/ws/vggt/checkpoints/model.pt")
+    parser.add_argument('--output_dir', type=str, default="/home/vision/ws/vggt/runs/exp_tokens_ot/results/")
+    
+    parser.add_argument('--patch_size', type=int, default=14)
+    parser.add_argument('--special_tokens_num', type=int, default=5)
+    parser.add_argument('--target_size', type=int, nargs=2, default=[518,336])
+    # parser.add_argument('--target_size', type=int, nargs=2, default=[252,168])
+    
+    parser.add_argument('--dtu_root', type=str, default="/home/vision/ws/datasets/SampleSet/dtu_mvs")
+    parser.add_argument('--scan_id', type=int, default=4)
+    parser.add_argument('--num_views', type=int, default=4)
+    parser.add_argument('--view_step', type=int, default=1)
+    
+    parser.add_argument('--use_conf_filter', type=str2bool, default=False)
+    parser.add_argument('--conf_percentile', type=float, default=30.0)
+
+    parser.add_argument('--knockout_layer_idx', type=int, nargs='*', default=[], 
+                        help='List of layer indices for knockout (e.g., --knockout_layer_idx 4 11 17 23)')
+    parser.add_argument('--knockout_method', type=str, default="corres_mask")
+    parser.add_argument('--knockout_random_ratio', type=float, default=0.5)
+    parser.add_argument('--knockout_top_k', type=int, default=100)
+
+    parser.add_argument('--enable_token_merge', type=str2bool, default=False)
+    parser.add_argument('--token_merge_ratio', type=float, default=0.5)
+    parser.add_argument('--sx', type=int, default=5)
+    parser.add_argument('--sy', type=int, default=5)
+    parser.add_argument('--no_rand', type=str2bool, default=False)
+    parser.add_argument('--enable_protection', type=str2bool, default=True)
+
+    parser.add_argument('--calculate_rope_gain_ratio', type=str2bool, default=False)
+    parser.add_argument('--calculate_token_cos_similarity', type=str2bool, default=False)
+    parser.add_argument('--display_attn_map_after_softmax', type=str2bool, default=False)
+    parser.add_argument('--calculate_top_k_dominance', type=str2bool, default=False)
+    parser.add_argument('--use_local_display', type=str2bool, default=False)
+    parser.add_argument('--save_results', type=str2bool, default=False)
+
+    parser.add_argument('--use_stat_filter', type=str2bool, default=False)
+    parser.add_argument('--use_icp_alignment', type=str2bool, default=False)
+
+    args = parser.parse_args()
+
+    # Map args to config, handling type conversions if necessary
+    dtype = getattr(torch, args.dtype.replace("torch.", "")) if hasattr(torch, args.dtype.replace("torch.", "")) else torch.float16
+
+    # Compose configuration with parsed arguments (those that are set)
     cfg = VGGTReconstructConfig(
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        dtype=(
-            torch.bfloat16
-            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
-            else torch.float16
-        ),
-        checkpoint_path="/home/vision/ws/vggt/checkpoints/model.pt",
-        output_dir="/home/vision/ws/vggt/runs/exp_tokens_ot/results/",
-        patch_size=14,
-        special_tokens_num=5,
-        dtu_root="/home/vision/ws/datasets/SampleSet/dtu_mvs",
-        target_size=(518, 336),
-        # target_size=(252, 168),
-        scan_id=4,
-        num_views=4,
-        view_step=1,
-        use_conf_filter=False,
-        conf_percentile=30.0,
-        
-        knockout_layer_idx=[],
-        knockout_method="corres_mask",
-        knockout_random_ratio=0.5,
-        knockout_top_k=100,
-
-
-        # FastVGGT token merge options
-        enable_token_merge=True,
-        token_merge_ratio=0.5,
-        sx=5,
-        sy=5,
-        no_rand = True,
-        enable_protection = False,
-
-        # debug options
-        calculate_rope_gain_ratio=False,
-        calculate_token_cos_similarity = False,
-        display_attn_map_after_softmax = False,
-        calculate_top_k_dominance = False,
-        
-        use_local_display=True,
-        save_results=False,
+        device=args.device,
+        dtype=dtype,
+        checkpoint_path=args.checkpoint_path,
+        output_dir=args.output_dir,
+        patch_size=args.patch_size,
+        special_tokens_num=args.special_tokens_num,
+        dtu_root=args.dtu_root,
+        target_size=tuple(args.target_size),
+        scan_id=args.scan_id,
+        num_views=args.num_views,
+        view_step=args.view_step,
+        use_conf_filter=args.use_conf_filter,
+        conf_percentile=args.conf_percentile,
+        knockout_layer_idx=args.knockout_layer_idx or [],
+        knockout_method=args.knockout_method,
+        knockout_random_ratio=args.knockout_random_ratio,
+        knockout_top_k=args.knockout_top_k,
+        enable_token_merge=args.enable_token_merge,
+        token_merge_ratio=args.token_merge_ratio,
+        sx=args.sx,
+        sy=args.sy,
+        no_rand=args.no_rand,
+        enable_protection=args.enable_protection,
+        calculate_rope_gain_ratio=args.calculate_rope_gain_ratio,
+        calculate_token_cos_similarity=args.calculate_token_cos_similarity,
+        display_attn_map_after_softmax=args.display_attn_map_after_softmax,
+        calculate_top_k_dominance=args.calculate_top_k_dominance,
+        use_local_display=args.use_local_display,
+        save_results=args.save_results,
+        use_stat_filter=args.use_stat_filter,
+        use_icp_alignment=args.use_icp_alignment,
     )
-
-    token_fusion_strategy_cfg = TokenFusionStrategyConfig(
-        dtu_mvs_root=cfg.dtu_root,
+    
+    from pprint import pprint
+    print("Configuration (cfg):")
+    pprint(vars(cfg))
+    
+    loader = DTUScanLoader(
+        cfg.dtu_root,
         scan_id=cfg.scan_id,
         num_views=cfg.num_views,
         step=cfg.view_step,
+        device=cfg.device,
+        target_size=cfg.target_size,
+    )
+
+    token_fusion_strategy_cfg = TokenFusionStrategyConfig(
+        loader=loader,
         device=cfg.device,
         target_size=cfg.target_size,
         patch_size=cfg.patch_size,
@@ -204,50 +273,61 @@ if __name__ == "__main__":
             additional_configs={"token_fusion_strategy_cfg": token_fusion_strategy_cfg},
         )
 
-    model = VGGT(token_weighter=token_weighter)
-    model.load_state_dict(torch.load(cfg.checkpoint_path))
+    model = VGGT(
+        enable_point = False,
+        enable_track = False,
+        token_weighter=token_weighter
+    )
+    model.load_state_dict(torch.load(cfg.checkpoint_path), strict=False)
     model.to(cfg.device)
     model.eval()
 
-    gts = []  # 初始化 gts 列表
-    loader = DTUScanLoader(
-        cfg.dtu_root,
-        scan_id=cfg.scan_id,
-        num_views=cfg.num_views,
-        step=cfg.view_step,
-        device=cfg.device,
-        target_size=cfg.target_size,
-    )
     gt_images = loader.load_images()
     gt_depths = loader.load_depths()  # List[np.ndarray] 或类似格式
     gt_points, gt_points_colors = loader.load_points()  # [N, 3]
+    gt_points_np = gt_points.cpu().numpy()
+    gt_points_colors_np = gt_points_colors.cpu().numpy()
+
     gt_masks = loader.load_masks()  # List[np.ndarray] 或类似格式
     gt_intrinsics, gt_extrinsics = loader.load_cameras()  # (S, 3, 3), (S, 4, 4)
 
-    with torch.no_grad():
-        with torch.amp.autocast(cfg.device, dtype=cfg.dtype):
-            current_memory = torch.cuda.memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
-            predictions = model(gt_images)
-            additional_memory = torch.cuda.memory_allocated() - (current_memory + 1e9)
-            peak_memory = torch.cuda.max_memory_allocated()
-            additional_peak_memory = peak_memory - (current_memory + 1e9)
+    R = gt_extrinsics[0][:3, :3]   # (3, 3)
+    t = gt_extrinsics[0][:3, 3]    # (3,)
+    gt_points_world = gt_points_np @ R.T + t
 
-            print(f"Additional memory used: {additional_memory / (1024 ** 3)} GB")
-            print(
-                f"Additional peak memory used: {additional_peak_memory / (1024 ** 3)} GB"
-            )
+    import GPUtil
+    if torch.cuda.is_available():
+        gpus = GPUtil.getGPUs()
+        for gpu in gpus:
+            print(f"GPU {gpu.id}: {gpu.name}, total {gpu.memoryTotal}MB, used {gpu.memoryUsed}MB, free {gpu.memoryFree}MB")
+    else:
+        print(f"RAM usage: {psutil.virtual_memory().used/1024/1024:.2f} MB (of {psutil.virtual_memory().total/1024/1024:.2f} MB)")
 
-            if cfg.save_results:
-                with open(os.path.join(save_root, "memory_usage.txt"), "a") as f:
-                    f.write(
-                        f"Additional memory used: {additional_memory / (1024 ** 3)} GB\n"
-                    )
-                    f.write(
-                        f"Additional peak memory used: {additional_peak_memory / (1024 ** 3)} GB\n"
-                    )
-                    f.write(f"Current memory: {current_memory / (1024 ** 3)} GB\n")
-                    f.write(f"Peak memory: {peak_memory / (1024 ** 3)} GB\n")
+    
+    @torch.no_grad()
+    @torch.amp.autocast("cuda", dtype=cfg.dtype)
+    def run_model_with_memory_stats(model, images):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        
+        mem_before = torch.cuda.memory_allocated()
+
+        predictions = model(images)
+
+        torch.cuda.synchronize()
+        mem_after = torch.cuda.memory_allocated()
+        peak_mem = torch.cuda.max_memory_allocated()
+
+        additional_peak_mem = peak_mem - mem_before
+
+        return predictions, mem_before, peak_mem, additional_peak_mem
+
+
+    predictions, mem_before, peak_memory, additional_peak_memory = run_model_with_memory_stats(model, gt_images)
+
+    print(f"Memory before inference: {mem_before / (1024 ** 3)} GB")
+    print(f"Peak memory used: {peak_memory / (1024 ** 3)} GB")
+    print(f"Additional peak memory used: {additional_peak_memory / (1024 ** 3)} GB")
 
     if len(token_weighter.token_cosine_similarity) > 0:
         plt.figure()
@@ -398,10 +478,13 @@ if __name__ == "__main__":
         predictions["pose_enc"], gt_images.shape[-2:]
     )
 
-    depth = predictions["depth"].detach().cpu().numpy().reshape(gt_depths.shape)
-    depth_conf = (
-        predictions["depth_conf"].detach().cpu().numpy().reshape(gt_depths.shape)
-    )
+    depth = predictions["depth"].cpu().squeeze()
+    depth_conf = predictions["depth_conf"].cpu().squeeze()
+
+    # depth_conf_display = np.concatenate([i.numpy() for i in depth_conf])
+    # plt.imshow(depth_conf_display)
+    # plt.show()
+    
     pred_extrinsic = pred_extrinsic.detach().squeeze(0).cpu().numpy()
     pred_intrinsic = pred_intrinsic.detach().squeeze(0).cpu().numpy()
 
@@ -428,6 +511,147 @@ if __name__ == "__main__":
     print(
         "########################calculate pairwise pose estimation error done#########################"
     )
+
+    from evaluation.point_cloud_fusion import fusion_point_cloud
+    from evaluation.filter import filter_depth_by_conf, stat_filter, remove_Nan_Zero_Inf
+
+    depth, conf_mask = filter_depth_by_conf(depth,
+                                            depth_conf, 
+                                            cfg.conf_percentile, 
+                                            3.0,
+                                            verbose=True)
+
+    valid_mask = torch.logical_and(
+        gt_depths.squeeze().cpu() > 1e-3,
+        conf_mask,
+    )
+
+    # valid_mask_display = np.concatenate([i.squeeze().numpy() for i in valid_mask])
+    # plt.imshow(valid_mask_display)
+    # plt.show()
+
+    from evaluation.depth_estimation import calculate_depth_scales
+    scales_by_depth = calculate_depth_scales(depth.squeeze().cpu().numpy(), 
+                                             gt_depths.squeeze().cpu().numpy(), 
+                                             valid_mask.squeeze().cpu().numpy())
+    mean_scale = np.mean(scales_by_depth)
+    print(f"scales_by_depth: {scales_by_depth}")
+    print(f"mean_scale: {mean_scale}")
+
+    N = depth.shape[0]
+    for i in range(N):
+        depth[i] = depth[i] * scales_by_depth[i]
+        pred_extrinsic[i][:3, 3] = pred_extrinsic[i][:3, 3] * scales_by_depth[i]
+
+    fused_points, fused_colors = fusion_point_cloud(depth, 
+                                                    pred_extrinsic, 
+                                                    pred_intrinsic, 
+                                                    gt_images, 
+                                                    dist_thresh=7.0, 
+                                                    num_consist=2, 
+                                                    scale_factor=1.0)
+
+    fused_points, fused_colors = remove_Nan_Zero_Inf(fused_points, fused_colors)
+    gt_points_world, gt_points_colors_np = remove_Nan_Zero_Inf(gt_points_world, gt_points_colors_np)
+
+    from evaluation.display import display_point_clouds
+    display_point_clouds([fused_points], [fused_colors], title="transformed pred points")
+
+    if cfg.use_stat_filter:
+        fused_points, fused_colors, fused_ind = stat_filter(fused_points, fused_colors, nb_neighbors=20, std_ratio=2.0)
+        gt_points_world, gt_points_colors_np, gt_ind = stat_filter(gt_points_world, gt_points_colors_np, nb_neighbors=20, std_ratio=2.0)
+
+    from evaluation.registration import register_point_clouds_open3d_icp
+    if cfg.use_icp_alignment:
+        transformed_pred_points, transformation = register_point_clouds_open3d_icp(fused_points, gt_points_world)
+    else:
+        transformed_pred_points, transformation = fused_points, np.eye(4)
+
+    search_best_scale = False
+    if search_best_scale:
+        all_chamfer_dists = []
+        for i in range(-50, 10, 1):
+            print(f"--------------------{i}--------------------")
+            chamfer_dist = compute_chamfer_distance(
+                np.asarray(pred_cloud.points) * (mean_scale + i*0.1), np.asarray(gt_cloud.points), 1.0,
+            )
+            all_chamfer_dists.append(chamfer_dist)
+
+        plt.plot(all_chamfer_dists)
+        plt.show()
+
+        min_chamfer_dist = np.min(all_chamfer_dists)
+        min_chamfer_dist_idx = np.argmin(all_chamfer_dists)
+        print(f"min_chamfer_dist: {min_chamfer_dist}")
+        print(f"min_chamfer_dist_idx: {min_chamfer_dist_idx}")
+
+        pred_cloud.points = o3d.utility.Vector3dVector(np.asarray(pred_cloud.points) * (mean_scale + min_chamfer_dist_idx*0.1))
+
+    chamfer_dist = compute_chamfer_distance(
+        transformed_pred_points, gt_points_world, 2.0, True
+    )
+    print(f"chamfer_dist: {chamfer_dist}")
+
+
+    display_point_clouds([transformed_pred_points, gt_points_world], [fused_colors, gt_points_colors_np], title="transformed pred points")
+
+    sys.exit()
+    """
+
+    print(f"After valid_mask filter - gt_pts_filtered shape: {gt_pts_filtered.shape}")
+    print(f"After valid_mask filter - pred_pts_filtered shape: {pred_pts_filtered.shape}")
+
+    # 统计滤波去除离群点
+    pcd_gt_filter, ind_gt = stat_filter(gt_pts_filtered, nb_neighbors=20, std_ratio=2.0)
+    print(f"GT statistical filter: {len(gt_pts_filtered)} -> {len(ind_gt)} points")
+
+    pcd_pred_filter, ind_pred = stat_filter(pred_pts_filtered, nb_neighbors=20, std_ratio=2.0)
+    print(f"Pred statistical filter: {len(pred_pts_filtered)} -> {len(ind_pred)} points")
+
+    # 取两个滤波结果的交集，确保点云对应关系
+    ind_gt_set = set(ind_gt)
+    ind_pred_set = set(ind_pred)
+    ind_common = list(ind_gt_set & ind_pred_set)
+    print(f"Common indices after both filters: {len(ind_common)} points")
+
+    # 使用共同索引过滤点云
+    gt_pts_masked = gt_pts_filtered[ind_common].T  # (K, 3) -> (3, K)
+    pred_pts_masked = pred_pts_filtered[ind_common].T  # (K, 3) -> (3, K)
+    colors_flat_aligned = colors_flat_filtered[ind_common]  # (K, 3)
+
+    print(f"Final gt_pts_masked shape: {gt_pts_masked.shape}")
+    print(f"Final pred_pts_masked shape: {pred_pts_masked.shape}")
+
+    from evaluation.pointmap_estimation import umeyama_alignment
+
+    scale, R, t = umeyama_alignment(pred_pts_masked, gt_pts_masked)
+
+    pred_pts_masked_aligned = R @ (scale * pred_pts_masked) + t[:, np.newaxis]
+
+    print(f"scale: {scale}")
+    print(f"R: {R}")
+    print(f"t: {t}")
+
+    chamfer_dist = compute_chamfer_distance(
+        pred_pts_masked_aligned.T, gt_pts_masked.T, 1.0
+    )
+
+    import open3d as o3d
+    pcd_gt = o3d.geometry.PointCloud()
+    pcd_gt.points = o3d.utility.Vector3dVector(gt_pts_masked.T)
+    cl, ind = pcd_gt.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pcd_gt = pcd_gt.select_by_index(ind)
+
+    
+    pcd_pred = o3d.geometry.PointCloud()
+    pcd_pred.points = o3d.utility.Vector3dVector(pred_pts_masked_aligned.T)
+    pcd_pred.colors = o3d.utility.Vector3dVector(colors_flat_aligned.astype(np.float32) / 255.0)
+    cl, ind = pcd_pred.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    pcd_pred = pcd_pred.select_by_index(ind)
+    o3d.visualization.draw_geometries([pcd_gt, pcd_pred])
+
+    # sys.exit()
+    """
 
     pred_points_from_depth = unproject_depth_map_to_point_map(
         depth, pred_extrinsic, pred_intrinsic
@@ -513,6 +737,10 @@ if __name__ == "__main__":
     pred_points_from_depth_flat = np.asarray(pcd_pred.points)
     gt_pts_from_depth_flat = np.asarray(pcd_gt.points)
 
+    chamfer_dist = compute_chamfer_distance(
+        pred_points_from_depth_flat, gt_pts_from_depth_flat, 1.0
+    )
+
     if cfg.save_results:
         save_config_to_json(
             cfg,
@@ -527,6 +755,4 @@ if __name__ == "__main__":
         geometries = [pcd_gt, pcd_pred]
         o3d.visualization.draw_geometries(geometries)
 
-    chamfer_dist = compute_chamfer_distance(
-        pred_points_from_depth_flat, gt_pts_from_depth_flat, 5.0
-    )
+

@@ -140,10 +140,7 @@ def apply_heatmap(image, heatmap, alpha=0.4):
         
 @dataclass
 class TokenFusionStrategyConfig:
-    dtu_mvs_root: str = "placeholder"
-    scan_id: int = 1
-    num_views: int = 1
-    step: int = 1
+    loader: DTUScanLoader = None
     device: str = "cpu"
     target_size: Tuple[int, int] = (518, 350)
     patch_size: int = 14
@@ -176,16 +173,9 @@ class TokenFusionStrategy:
             else:
                 return getattr(args, key, default)
         
-        self.loader = DTUScanLoader(
-            dtu_mvs_root=get_arg('dtu_mvs_root'),
-            scan_id=get_arg('scan_id'),
-            num_views=get_arg('num_views'),
-            step=get_arg('step'),
-            device=get_arg('device'), 
-            target_size=get_arg('target_size'),
-        )
+        self.loader = get_arg('loader')
         # 保存常用参数
-        self.num_views = get_arg('num_views')
+        self.num_views = self.loader.num_views
         self.target_size = get_arg('target_size')
         self.width = self.target_size[0]
         self.height = self.target_size[1]
@@ -203,7 +193,7 @@ class TokenFusionStrategy:
         self.world_coords = []
         self.intrinsics = []
         self.extrinsics = []
-        for i in range(get_arg('num_views')):
+        for i in range(self.loader.num_views):
             image_i, depth_i, mask_i, world_coords_i, intrinsic_i, extrinsic_i = process_dtu_view(self.loader, i)
             self.images.append(image_i)
             self.depths.append(depth_i)
@@ -218,7 +208,15 @@ class TokenFusionStrategy:
         # for random knockout
         self.knockout_random_ratio = get_arg('knockout_random_ratio')
         # visible score mask matrix
-        self.visible_scores = torch.tensor(np.array(self.calculate_visible_score_all()))
+        if not len(self.knockout_layer_idx) == 0 and self.knockout_method == "visible_score":
+            self.visible_scores = torch.tensor(np.array(self.calculate_visible_score_all()))
+        else:
+            self.visible_scores = None
+        # for percise corresponding attention knockout
+        if not len(self.knockout_layer_idx) == 0 and self.knockout_method == "corres_mask":
+            self.corres_masks = self.calculate_corresponding_attention_mask()
+        else:
+            self.corres_masks = None
         # for top-k preserved knockout      
         self.knockout_top_k = get_arg('knockout_top_k')
 
@@ -248,9 +246,6 @@ class TokenFusionStrategy:
 
         # for attention rollout calculation
         self.attention_map_rollout = None
-
-        # for percise corresponding attention knockout
-        self.corres_masks = self.calculate_corresponding_attention_mask()
 
         # for display attention map after softmax
         self.display_attn_map_after_softmax = get_arg('display_attn_map_after_softmax')
@@ -344,43 +339,43 @@ class TokenFusionStrategy:
     def calculate_top_k_dominance(self, attn_map: Tensor, threshold: float = 0.9):
         if not self.calc_top_k_dominance:
             return
+        @torch.no_grad()
         def compute_topk_dominance(attention_map, threshold=0.9):
             """
             attention_map: [1, H, N, K] 或 [H, N, K]
             只在 CPU 上做统计，避免占用 GPU 显存
             """
-            # 全程不需要梯度
-            with torch.no_grad():
-                attn = attention_map.squeeze(0)      # [H, N, K]
-                # 注释掉这一行以分开计算每个head的top-k dominance #########
-                # attn = attn.sum(dim=0).unsqueeze(0)  # [1, N, K]
-                # attn = attn.mean(dim=0).unsqueeze(0)  # [1, N, K]
-                ######################################################
-                H, N, K = attn.shape
+            attn = attention_map.squeeze(0)      # [H, N, K]
+            # 注释掉这一行以分开计算每个head的top-k dominance #########
+            # attn = attn.sum(dim=0).unsqueeze(0)  # [1, N, K]
+            # attn = attn.mean(dim=0).unsqueeze(0)  # [1, N, K]
+            ######################################################
+            H, N, K = attn.shape
 
-                attn = attn.detach().to("cpu", dtype=torch.float32)  # 如果 K 很大，可以改成 float16
+            attn = attn.detach().to("cpu", dtype=torch.float32)  # 如果 K 很大，可以改成 float16
 
-                k_per_query = torch.zeros(H, N, dtype=torch.float32)
+            k_per_query = torch.zeros(H, N, dtype=torch.float32)
 
-                for h in range(H):
-                    attn_h = attn[h]  # [N, K]
-                    sorted_scores, _ = torch.sort(attn_h, dim=-1, descending=True)  # [N, K]
-                    cumsum = torch.cumsum(sorted_scores, dim=-1)                    # [N, K]
-                    mask = cumsum >= threshold                                      # [N, K] bool
+            for h in range(H):
+                attn_h = attn[h]  # [N, K]
+                sorted_scores, _ = torch.sort(attn_h, dim=-1, descending=True)  # [N, K]
+                cumsum = torch.cumsum(sorted_scores, dim=-1)                    # [N, K]
+                mask = cumsum >= threshold                                      # [N, K] bool
 
-                    has_true = mask.any(dim=-1)                                     # [N]
-                    first_idx = mask.float().argmax(dim=-1)                         # [N]
+                has_true = mask.any(dim=-1)                                     # [N]
+                first_idx = mask.float().argmax(dim=-1)                         # [N]
 
-                    k_per_query[h] = torch.where(
-                        has_true,
-                        first_idx + 1,
-                        torch.full_like(first_idx, fill_value=K)
-                    ).float()
+                k_per_query[h] = torch.where(
+                    has_true,
+                    first_idx + 1,
+                    torch.full_like(first_idx, fill_value=K)
+                ).float()
 
-                k_mean = (k_per_query.mean() / K).item()
-                return k_mean, k_per_query
+            k_mean = (k_per_query.mean() / K).item()
+            return k_mean, k_per_query
                 
         k_mean, k_per_query = compute_topk_dominance(attn_map, threshold)
+        print(f"k_per_query: {k_per_query}")
         self.top_k_dominance.append(k_mean)
         return k_mean, k_per_query
 
@@ -443,7 +438,9 @@ class TokenFusionStrategy:
                 # self.token_weighter.visualize_attn_map(attn_after_softmax, [0, 500, 930, 1430], [0, 1, 2])
 
         """
-        if self.enable_token_merge or not self.display_attn_map_after_softmax:
+        if self.enable_token_merge:
+            return
+        if not self.display_attn_map_after_softmax:
             return
         def get_attn_map(attn_map: Tensor, token_idx: int, image_idx: int, head: int):
             if token_idx > self.num_views * (self.num_tokens_per_image + self.special_tokens_num) or image_idx > self.num_views - 1:
@@ -594,7 +591,6 @@ class TokenFusionStrategy:
                     corres_masks.append(calc_corres_attn_mask_token_i(i, r, c))
         return corres_masks
        
-
     def calculate_visible_score(self, src_view_idx: int, tgt_view_idx: int) -> np.ndarray:
         image_0, depth_0, mask_0, world_coords_0, intrinsic_0, extrinsic_0 = self.images[src_view_idx], self.depths[src_view_idx], self.masks[src_view_idx], self.world_coords[src_view_idx], self.intrinsics[src_view_idx], self.extrinsics[src_view_idx]
         image_1, depth_1, mask_1, world_coords_1, intrinsic_1, extrinsic_1 = self.images[tgt_view_idx], self.depths[tgt_view_idx], self.masks[tgt_view_idx], self.world_coords[tgt_view_idx], self.intrinsics[tgt_view_idx], self.extrinsics[tgt_view_idx]

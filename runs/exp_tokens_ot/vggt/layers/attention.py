@@ -27,7 +27,19 @@ from merging.merge import token_merge_bipartite2d
 
 XFORMERS_AVAILABLE = False
 
-class GlobalAttentionWithTokenMerge(nn.Module):
+def print_tensor_info(tensor, name="Tensor"):
+    """
+    打印张量的名字、形状和占用的显存大小（单位MB），以及所在设备。
+    """
+    if isinstance(tensor, torch.Tensor):
+        num_bytes = tensor.element_size() * tensor.numel()
+        mem_mb = num_bytes / 1024 / 1024
+        print(f"{name}: shape={tuple(tensor.shape)}, device={tensor.device}, size={mem_mb:.2f} MB")
+    else:
+        print(f"{name}: 不是torch.Tensor类型，实际类型: {type(tensor)}")
+
+
+class GlobalAttention(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -87,141 +99,42 @@ class GlobalAttentionWithTokenMerge(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k) # (B, num_heads, N, head_dim)
         q, k = self.token_weighter.rope(self.rope, q, k, pos)
-        _, _, H, D = q.shape
-
         q, k, v =self.token_weighter.token_merge_FastVGGT(x, q, k, v)
-
         N_m = q.shape[-2]
+        if N_m != N:
+            print(f"token merge ratio of layer {idx}: {N_m / N}")
 
-        q = q * self.scale
-        attn_before_softmax = q @ k.transpose(-2, -1)
-        attn_after_softmax = attn_before_softmax.softmax(dim=-1)
-        attn_after_softmax = self.token_weighter.attention_knockout(attn_after_softmax, idx)
-        self.token_weighter.visualize_attn_map_all_heads(attn_after_softmax, 491+5, 1)
-        self.token_weighter.calculate_top_k_dominance(attn_after_softmax)
-        attn = self.attn_drop(attn_after_softmax)
-        x = attn @ v
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
 
-        del q, k, v
+        # # if idx == 15:
+        # #     q = q[:, 15, :, :]
+        # #     k = k[:, 15, :, :]
+        # #     v = v[:, 15, :, :]
+
+        # q = q * self.scale
+        # attn_map = q @ k.transpose(-2, -1)
+        # attn_map = attn_map.softmax(dim=-1)
+        # # if idx in range(12, 16, 1):
+        # # if idx == 15:
+        # #     attn_map = attn_map[:, 15, :, :]
+        # #     attn_map = attn_map.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        # # if idx == 17:
+        # #     attn_map = attn_map[:, 5, :, :]
+        # #     attn_map = attn_map.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+        # attn_map = self.token_weighter.attention_knockout(attn_map, idx)
+        # self.token_weighter.visualize_attn_map_all_heads(attn_map, 491+5, 1)
+        # self.token_weighter.calculate_top_k_dominance(attn_map)
+        # x = self.attn_drop(attn_map) @ v
+        # # if idx == 15:
+        # #     x = x.unsqueeze(1).expand(-1, self.num_heads, -1, -1)
+
+        # del v, attn_map
 
         x = x.transpose(1, 2).reshape(B, N_m, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         x = self.token_weighter.token_unmerge_FastVGGT(x)
         return x
-
-class GlobalAttention(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = True,
-        proj_bias: bool = True,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        norm_layer: nn.Module = nn.LayerNorm,
-        qk_norm: bool = False,
-        fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
-        token_weighter: TokenFusionStrategy = None,
-        rope=None,
-    ) -> None:
-        super().__init__()
-        assert dim % num_heads == 0, "dim should be divisible by num_heads"
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-
-        # for zcl test
-        self.fused_attn = fused_attn
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim, bias=proj_bias)
-        self.proj_drop = nn.Dropout(proj_drop)
-        self.rope = rope
-
-        self.ot_params = {
-            'reg':0.1,
-            'reg_kl':10,
-            'sinkhorn_iterations':10,
-            'mass':0.9,
-            'bin_score':0.3
-        }
-        self.matcher = SoftmaxMatcher(**self.ot_params)
-        self.matcher.eval()
-        self.token_weighter = token_weighter
-    
-    def set_use_fused_attn(self, use_fused: bool) -> None:
-        print("set_use_fused_attn: ", use_fused)
-        self.fused_attn = use_fused
-
-    def forward(self, x: Tensor, pos=None, idx=None) -> Tensor:
-
-        # self.token_weighter.calculate_token_cos_similarity(x, idx)
-        # print(f"visualize token similarity heatmap of layer {idx}")
-        # self.token_weighter.visualize_token_similarity_heatmap(x, [1, 2, 3, 4, 931, 932, 933, 934], [0, 1, 2, 3])
-
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k) # (B, num_heads, N, head_dim)
-
-        # q_original = q.clone()
-
-        if self.rope is not None:
-            q = self.rope(q, pos)
-            k = self.rope(k, pos)
-
-        # calculate rope gain
-        # self.token_weighter.calculate_rope_gain(q_original, q)
-        # del q_original
-
-        attn_before_softmax = None
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-        else:
-            q = q * self.scale
-            attn_before_softmax = q @ k.transpose(-2, -1)
-
-            # # 显示softmax之前的注意力图，用来观察attention collapse现象 (FastVGGT中的显示方式)
-            # display_attn_map_before_softmax = False
-            # if display_attn_map_before_softmax:
-            #     print(f"Display attn map before softmax of layer {idx}")
-            #     self.token_weighter.visualize_attn_map(attn_before_softmax, [0, 500, 930, 1430], [0, 1, 2])
-
-            attn_before_softmax = self.token_weighter.attention_knockout(attn_before_softmax, idx)
-            attn_after_softmax = attn_before_softmax.softmax(dim=-1)
-
-            patch_row, patch_col = 0, 0
-            print(f"idx: {idx}")
-            self.token_weighter.calculate_visible_mask(attn_before_softmax, (patch_row, patch_col), 0, 1)
-
-            # # 显示softmax之后的注意力图，更容易观察到注意力中的匹配现象
-            # display_attn_map_after_softmax = False
-            # if display_attn_map_after_softmax:
-            #     print(f"Display attn map after softmax of layer {idx}")
-            #     self.token_weighter.visualize_attn_map(attn_after_softmax, [0, 1, 2, 3, 4], [0, 1, 2, 3])
-            #     self.token_weighter.visualize_attn_map(attn_after_softmax, [500, 800], [0, 1, 2, 3])
-
-            # # 计算after softmax 之后的 top-k dominance 达到百分之90的token比例
-            # calculate_top_k_dominance = False
-            # if calculate_top_k_dominance:
-            #     k_mean, k_per_query = self.token_weighter.calculate_top_k_dominance(attn_after_softmax)
-            #     print(f"k_mean: {k_mean}")
-            #     del k_mean, k_per_query
-
-            attn = self.attn_drop(attn_after_softmax)
-            x = attn @ v
-        
-        x = x.transpose(1, 2).reshape(B, N, C) 
-        x = self.proj(x)
-        x = self.proj_drop(x)
-
-
-        return x
-
 
 class Attention(nn.Module):
     def __init__(
@@ -270,15 +183,17 @@ class Attention(nn.Module):
 
         attn_before_softmax = None
 
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
-        else:
-            q = q * self.scale
-            attn_before_softmax = q @ k.transpose(-2, -1)
-            attn_after_softmax = attn_before_softmax.softmax(dim=-1)
-            attn = self.attn_drop(attn_after_softmax)
-            x = attn @ v
-
+        # if self.fused_attn:
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+        # else:
+        #     q = q * self.scale
+        #     attn_map = (q @ k.transpose(-2, -1)).softmax(dim=-1)
+        #     attn = self.attn_drop(attn_map)
+        #     x = attn @ v
+        #     del attn, attn_map
+            
+        del q, k, v
+            
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -305,30 +220,3 @@ class MemEffAttention(Attention):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-
-def resize_attention_map(attn_map, target_shape):
-    attn_map_normalized = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
-    attn_map_resized = cv.resize(attn_map_normalized, (target_shape[1], target_shape[0]), interpolation=cv.INTER_LINEAR)
-    return attn_map_resized
-
-def apply_heatmap(image, heatmap, alpha=0.6):
-    """
-    :param image: 原始图像，shape (H, W, 3)
-    :param heatmap: 注意力图，shape (H, W)，值范围 [0, 1]
-    :param alpha: 热图透明度
-    """
-    # 确保图像数据类型一致
-    image *= 255
-    if image.dtype != np.uint8:
-        image = image.astype(np.uint8)
-    
-    heatmap_colored = cv.applyColorMap(np.uint8(255 * heatmap), cv.COLORMAP_JET)
-    
-    # 如果图像不是 uint8 类型，进行转换
-    if heatmap_colored.dtype != np.uint8:
-        heatmap_colored = heatmap_colored.astype(np.uint8)
-    
-    
-    # image_enhanced = cv.convertScaleAbs(image, alpha=1.5, beta=0)
-    output = cv.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
-    return output
