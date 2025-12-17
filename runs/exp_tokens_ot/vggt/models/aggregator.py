@@ -206,36 +206,38 @@ class Aggregator(nn.Module):
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
-        # Normalize images and reshape for patch embed
-        # resnet mean and std are in [0, 1] range
+        # 归一化并送入 patch_embed，这里沿用当前 autocast 的 dtype（通常是 fp16/bf16）
         images = (images - self._resnet_mean) / self._resnet_std
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
         patch_tokens = self.patch_embed(images)
+        del images
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
-        _, P, C = patch_tokens.shape # (B*S, num_patches, embed_dim)
+        _, P, C = patch_tokens.shape  # (B*S, num_patches, embed_dim)
 
         # Expand camera and register tokens to match batch size and sequence length
-        camera_token = slice_expand_and_flatten(self.camera_token, B, S) # -> (B*S, 1, embed_dim)
-        register_token = slice_expand_and_flatten(self.register_token, B, S) # -> (B*S, 4, embed_dim)
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S)  # -> (B*S, 1, embed_dim)
+        register_token = slice_expand_and_flatten(self.register_token, B, S)  # -> (B*S, 4, embed_dim)
 
         # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        del camera_token, register_token, patch_tokens
 
         pos = None
         if self.rope is not None:
-            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=tokens.device)
 
-        if self.patch_start_idx > 0:
+        if self.patch_start_idx > 0 and pos is not None:
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
             pos = pos + 1
-            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2, device=tokens.device, dtype=pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
+            del pos_special
 
         # update P because we added special tokens
         _, P, C = tokens.shape
@@ -244,33 +246,74 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
 
-        for _ in range(self.aa_block_num):
+        # Only keep intermediates for a subset of blocks (for downstream 4DPT, etc.)
+        # Follow the logic from FastVGGT: indices are w.r.t. aa_block_num
+        block4DPT_idx = [4, 11, 17, 23]
+
+        for block_num in range(self.aa_block_num):
+            # 同步并适度清理缓存，避免显存碎片过多（参考 FastVGGT）
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            # 清理 RoPE 与 position_getter 的 cache，防止累积占用显存
+            if hasattr(self, "rope") and self.rope is not None and hasattr(self.rope, "frequency_cache"):
+                self.rope.frequency_cache.clear()
+            if hasattr(self, "position_getter") and self.position_getter is not None:
+                if hasattr(self.position_getter, "position_cache"):
+                    current_cache = self.position_getter.position_cache.copy()
+                    if len(current_cache) > 1:
+                        self.position_getter.position_cache.clear()
+                        if current_cache:
+                            key = list(current_cache.keys())[-1]
+                            self.position_getter.position_cache[key] = current_cache[key]
+
+            # Decide whether we need to keep intermediates for this block
+            need_intermediates = block_num in block4DPT_idx
+
+            frame_intermediates = None
+            global_intermediates = None
+
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos, need_intermediates=need_intermediates
                     )
-                        
-
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, need_intermediates=need_intermediates
                     )
 
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            for i in range(len(frame_intermediates)):
+            # Only keep and append intermediates for selected blocks
+            if need_intermediates and frame_intermediates is not None and global_intermediates is not None:
                 # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                # Following FastVGGT, we only need the first element in the list
+                concat_inter = torch.cat(
+                    [frame_intermediates[0].detach(), global_intermediates[0].detach()],
+                    dim=-1,
+                )
                 output_list.append(concat_inter)
-        
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
+                del concat_inter, frame_intermediates, global_intermediates
+            else:
+                # Explicitly free if they exist but are not needed
+                if frame_intermediates is not None:
+                    del frame_intermediates
+                if global_intermediates is not None:
+                    del global_intermediates
+
+        # 最后一次清理大 tensor，帮助降低峰值显存
+        del tokens
+        if pos is not None:
+            del pos
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, need_intermediates: bool = False):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -281,7 +324,7 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B * S, P, 2):
             pos = pos.view(B, S, P, 2).view(B * S, P, 2)
 
-        intermediates = []
+        intermediates = [] if need_intermediates else None
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
@@ -290,11 +333,12 @@ class Aggregator(nn.Module):
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            if need_intermediates:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, need_intermediates: bool = False):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -304,7 +348,7 @@ class Aggregator(nn.Module):
         if pos is not None and pos.shape != (B, S * P, 2):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
-        intermediates = []
+        intermediates = [] if need_intermediates else None
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
@@ -312,7 +356,8 @@ class Aggregator(nn.Module):
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, idx=global_idx)
             global_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            if need_intermediates:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 

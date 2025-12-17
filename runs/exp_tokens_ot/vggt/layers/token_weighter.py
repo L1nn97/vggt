@@ -209,11 +209,13 @@ class TokenFusionStrategy:
         self.knockout_random_ratio = get_arg('knockout_random_ratio')
         # visible score mask matrix
         if not len(self.knockout_layer_idx) == 0 and self.knockout_method == "visible_score":
+            print("calculate visible score all")
             self.visible_scores = torch.tensor(np.array(self.calculate_visible_score_all()))
         else:
             self.visible_scores = None
         # for percise corresponding attention knockout
         if not len(self.knockout_layer_idx) == 0 and self.knockout_method == "corres_mask":
+            print("calculate corresponding attention mask")
             self.corres_masks = self.calculate_corresponding_attention_mask()
         else:
             self.corres_masks = None

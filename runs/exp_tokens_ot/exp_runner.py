@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Tuple, List, Dict, Any
 from datetime import datetime
@@ -308,27 +309,32 @@ if __name__ == "__main__":
     @torch.no_grad()
     @torch.amp.autocast("cuda", dtype=cfg.dtype)
     def run_model_with_memory_stats(model, images):
+        # 同步并清零峰值显存统计
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
         
         mem_before = torch.cuda.memory_allocated()
 
+        # 统计推理时间（毫秒）
+        start = time.time()
         predictions = model(images)
-
         torch.cuda.synchronize()
+        end = time.time()
+        inference_time_ms = (end - start) * 1000.0
+
         mem_after = torch.cuda.memory_allocated()
         peak_mem = torch.cuda.max_memory_allocated()
 
         additional_peak_mem = peak_mem - mem_before
 
-        return predictions, mem_before, peak_mem, additional_peak_mem
-
-
-    predictions, mem_before, peak_memory, additional_peak_memory = run_model_with_memory_stats(model, gt_images)
+        return predictions, mem_before, peak_mem, additional_peak_mem, inference_time_ms
+    
+    predictions, mem_before, peak_memory, additional_peak_memory, inference_time_ms = run_model_with_memory_stats(model, gt_images)
 
     print(f"Memory before inference: {mem_before / (1024 ** 3)} GB")
     print(f"Peak memory used: {peak_memory / (1024 ** 3)} GB")
     print(f"Additional peak memory used: {additional_peak_memory / (1024 ** 3)} GB")
+    print(f"Inference time: {inference_time_ms:.3f} ms")
 
     if len(token_weighter.token_cosine_similarity) > 0:
         plt.figure()
@@ -579,14 +585,18 @@ if __name__ == "__main__":
         )
 
     if cfg.save_results:
-        # 1) 保存 Chamfer Distance 到文本文件
+        # 1) 保存 Chamfer Distance 和推理时间到文本文件
         metrics_path = os.path.join(save_root, "metrics.txt")
         with open(metrics_path, "a") as f:
             f.write(
                 f"scan_id={cfg.scan_id}, num_views={cfg.num_views}, "
                 f"use_icp_alignment={cfg.use_icp_alignment}, "
                 f"use_stat_filter={cfg.use_stat_filter}, "
-                f"chamfer_dist={chamfer_dist}\n"
+                f"chamfer_dist={chamfer_dist}, "
+                f"inference_time_ms={inference_time_ms:.3f}, "
+                f"mem_before_GB={mem_before / (1024 ** 3):.6f}, "
+                f"peak_memory_GB={peak_memory / (1024 ** 3):.6f}, "
+                f"additional_peak_memory_GB={additional_peak_memory / (1024 ** 3):.6f}\n"
             )
 
         # 2) 保存变换后的预测点云（numpy 格式）
