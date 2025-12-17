@@ -646,8 +646,8 @@ class TokenFusionStrategy:
         if curr_layer_idx not in self.knockout_layer_idx and -1 not in self.knockout_layer_idx:
             return attn_map
 
-        # fill_value = float('-inf')
-        fill_value = 0.0
+        fill_value = float('-inf') # for before softmax
+        # fill_value = 0.0
         if self.knockout_method == "random":
             print("random knockout for layer: ", curr_layer_idx)
             return random_knockout(attn_map, self.num_views, self.num_tokens_per_image, self.width // self.patch_size, self.height // self.patch_size, self.knockout_random_ratio, fill_value)

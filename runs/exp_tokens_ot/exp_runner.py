@@ -29,6 +29,7 @@ from evaluation.pointmap_estimation import umeyama_alignment
 import json
 
 from evaluation.utils import *
+from evaluation.display import display_point_clouds, render_point_cloud_from_view
 
 
 @dataclass
@@ -488,30 +489,6 @@ if __name__ == "__main__":
     pred_extrinsic = pred_extrinsic.detach().squeeze(0).cpu().numpy()
     pred_intrinsic = pred_intrinsic.detach().squeeze(0).cpu().numpy()
 
-    print(
-        "########################calculate pairwise pose estimation error#########################"
-    )
-    pairwise_metrics = compute_pairwise_relative_errors(
-        poses_pred=convert_poses_to_4x4(pred_extrinsic),
-        poses_gt=convert_poses_to_4x4(gt_extrinsics),
-        verbose=True,
-    )
-    # 保存所有统计结果到JSON文件
-    if cfg.save_results:
-        metrics_path = os.path.join(save_root, "evaluation_metrics.json")
-        save_evaluation_metrics(
-            weighted_stats=weighted_stats,
-            stats_list=stats_list,
-            total_valid_pixels=total_valid_pixels,
-            total_pixels=total_pixels,
-            valid_stats_list=valid_stats_list,
-            pairwise_metrics=pairwise_metrics,
-            save_path=metrics_path,
-        )
-    print(
-        "########################calculate pairwise pose estimation error done#########################"
-    )
-
     from evaluation.point_cloud_fusion import fusion_point_cloud
     from evaluation.filter import filter_depth_by_conf, stat_filter, remove_Nan_Zero_Inf
 
@@ -554,9 +531,6 @@ if __name__ == "__main__":
     fused_points, fused_colors = remove_Nan_Zero_Inf(fused_points, fused_colors)
     gt_points_world, gt_points_colors_np = remove_Nan_Zero_Inf(gt_points_world, gt_points_colors_np)
 
-    from evaluation.display import display_point_clouds
-    display_point_clouds([fused_points], [fused_colors], title="transformed pred points")
-
     if cfg.use_stat_filter:
         fused_points, fused_colors, fused_ind = stat_filter(fused_points, fused_colors, nb_neighbors=20, std_ratio=2.0)
         gt_points_world, gt_points_colors_np, gt_ind = stat_filter(gt_points_world, gt_points_colors_np, nb_neighbors=20, std_ratio=2.0)
@@ -598,13 +572,47 @@ if __name__ == "__main__":
     print(f"chamfer_dist: {chamfer_dist}")
 
     if cfg.use_local_display:
-        display_point_clouds([transformed_pred_points, gt_points_world], [fused_colors, gt_points_colors_np], title="transformed pred points")
-
-    if cfg.save_results:
-        save_config_to_json(
-            cfg,
-            os.path.join(save_root, "cfg.json"),
-            additional_configs={"token_fusion_strategy_cfg": token_fusion_strategy_cfg},
+        display_point_clouds(
+            [transformed_pred_points, gt_points_world],
+            [fused_colors, gt_points_colors_np],
+            title="transformed pred points",
         )
 
-    sys.exit()
+    if cfg.save_results:
+        # 1) 保存 Chamfer Distance 到文本文件
+        metrics_path = os.path.join(save_root, "metrics.txt")
+        with open(metrics_path, "a") as f:
+            f.write(
+                f"scan_id={cfg.scan_id}, num_views={cfg.num_views}, "
+                f"use_icp_alignment={cfg.use_icp_alignment}, "
+                f"use_stat_filter={cfg.use_stat_filter}, "
+                f"chamfer_dist={chamfer_dist}\n"
+            )
+
+        # 2) 保存变换后的预测点云（numpy 格式）
+        np.save(
+            os.path.join(save_root, "transformed_pred_points.npy"),
+            transformed_pred_points.astype(np.float32),
+        )
+
+        # 3) 使用 Open3D 渲染点云并保存为图像（仅渲染第一个视角可见的点）
+        try:
+            # 只渲染第一个视角
+            H, W = gt_images.shape[-2], gt_images.shape[-1]
+            view_idx = 0
+            
+            render_path = os.path.join(save_root, f"transformed_pred_vs_gt_cam{view_idx}.png")
+            render_point_cloud_from_view(
+                pred_points_world=transformed_pred_points,
+                pred_colors=fused_colors,
+                gt_points_world=gt_points_world,
+                gt_colors=gt_points_colors_np,
+                intrinsic=pred_intrinsic[view_idx],
+                extrinsic=pred_extrinsic[view_idx],
+                image_height=H,
+                image_width=W,
+                view_idx=view_idx,
+                save_path=render_path,
+            )
+        except Exception as e:
+            print(f"[save_results] WARNING: failed to render and save Open3D image: {e}")
