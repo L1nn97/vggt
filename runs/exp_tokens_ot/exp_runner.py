@@ -72,7 +72,7 @@ class VGGTReconstructConfig:
 
     # knockout 配置
     knockout_layer_idx: List[int] = field(default_factory=lambda: [])
-    knockout_method: str = "top_k"  # "random" or "visible_score" or "top_k"
+    knockout_method: str = "top_k"  # "random" or "visible_score" or "top_k" or "corres_mask"
     knockout_random_ratio: float = 0.1
     knockout_top_k: int = 100
 
@@ -561,11 +561,16 @@ if __name__ == "__main__":
         fused_points, fused_colors, fused_ind = stat_filter(fused_points, fused_colors, nb_neighbors=20, std_ratio=2.0)
         gt_points_world, gt_points_colors_np, gt_ind = stat_filter(gt_points_world, gt_points_colors_np, nb_neighbors=20, std_ratio=2.0)
 
+    print(f"fused_points shape: {fused_points.shape}, "
+          f"gt_points_world shape: {gt_points_world.shape}")
+
     from evaluation.registration import register_point_clouds_open3d_icp
     if cfg.use_icp_alignment:
         transformed_pred_points, transformation = register_point_clouds_open3d_icp(fused_points, gt_points_world)
     else:
         transformed_pred_points, transformation = fused_points, np.eye(4)
+
+    print(f"transformed_pred_points shape: {transformed_pred_points.shape}, ")
 
     search_best_scale = False
     if search_best_scale:
@@ -588,158 +593,12 @@ if __name__ == "__main__":
         pred_cloud.points = o3d.utility.Vector3dVector(np.asarray(pred_cloud.points) * (mean_scale + min_chamfer_dist_idx*0.1))
 
     chamfer_dist = compute_chamfer_distance(
-        transformed_pred_points, gt_points_world, 2.0, True
+        transformed_pred_points, gt_points_world, 2.0, True if cfg.use_local_display else False
     )
     print(f"chamfer_dist: {chamfer_dist}")
 
-
-    display_point_clouds([transformed_pred_points, gt_points_world], [fused_colors, gt_points_colors_np], title="transformed pred points")
-
-    sys.exit()
-    """
-
-    print(f"After valid_mask filter - gt_pts_filtered shape: {gt_pts_filtered.shape}")
-    print(f"After valid_mask filter - pred_pts_filtered shape: {pred_pts_filtered.shape}")
-
-    # 统计滤波去除离群点
-    pcd_gt_filter, ind_gt = stat_filter(gt_pts_filtered, nb_neighbors=20, std_ratio=2.0)
-    print(f"GT statistical filter: {len(gt_pts_filtered)} -> {len(ind_gt)} points")
-
-    pcd_pred_filter, ind_pred = stat_filter(pred_pts_filtered, nb_neighbors=20, std_ratio=2.0)
-    print(f"Pred statistical filter: {len(pred_pts_filtered)} -> {len(ind_pred)} points")
-
-    # 取两个滤波结果的交集，确保点云对应关系
-    ind_gt_set = set(ind_gt)
-    ind_pred_set = set(ind_pred)
-    ind_common = list(ind_gt_set & ind_pred_set)
-    print(f"Common indices after both filters: {len(ind_common)} points")
-
-    # 使用共同索引过滤点云
-    gt_pts_masked = gt_pts_filtered[ind_common].T  # (K, 3) -> (3, K)
-    pred_pts_masked = pred_pts_filtered[ind_common].T  # (K, 3) -> (3, K)
-    colors_flat_aligned = colors_flat_filtered[ind_common]  # (K, 3)
-
-    print(f"Final gt_pts_masked shape: {gt_pts_masked.shape}")
-    print(f"Final pred_pts_masked shape: {pred_pts_masked.shape}")
-
-    from evaluation.pointmap_estimation import umeyama_alignment
-
-    scale, R, t = umeyama_alignment(pred_pts_masked, gt_pts_masked)
-
-    pred_pts_masked_aligned = R @ (scale * pred_pts_masked) + t[:, np.newaxis]
-
-    print(f"scale: {scale}")
-    print(f"R: {R}")
-    print(f"t: {t}")
-
-    chamfer_dist = compute_chamfer_distance(
-        pred_pts_masked_aligned.T, gt_pts_masked.T, 1.0
-    )
-
-    import open3d as o3d
-    pcd_gt = o3d.geometry.PointCloud()
-    pcd_gt.points = o3d.utility.Vector3dVector(gt_pts_masked.T)
-    cl, ind = pcd_gt.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    pcd_gt = pcd_gt.select_by_index(ind)
-
-    
-    pcd_pred = o3d.geometry.PointCloud()
-    pcd_pred.points = o3d.utility.Vector3dVector(pred_pts_masked_aligned.T)
-    pcd_pred.colors = o3d.utility.Vector3dVector(colors_flat_aligned.astype(np.float32) / 255.0)
-    cl, ind = pcd_pred.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    pcd_pred = pcd_pred.select_by_index(ind)
-    o3d.visualization.draw_geometries([pcd_gt, pcd_pred])
-
-    # sys.exit()
-    """
-
-    pred_points_from_depth = unproject_depth_map_to_point_map(
-        depth, pred_extrinsic, pred_intrinsic
-    )
-    pred_points_from_depth_flat = pred_points_from_depth.reshape(-1, 3)
-    pred_points_from_depth_flat = (
-        pred_points_from_depth_flat @ pred_extrinsic[0][:3, :3].T
-        + pred_extrinsic[0][:3, 3]
-    )
-
-    gt_points_from_depth = unproject_depth_map_to_point_map(
-        gt_depths.cpu().numpy(), gt_extrinsics, gt_intrinsics
-    )
-    gt_pts_from_depth_flat = gt_points_from_depth.reshape(-1, 3)
-    gt_pts_from_depth_flat = (
-        gt_pts_from_depth_flat @ gt_extrinsics[0][:3, :3].T + gt_extrinsics[0][:3, 3]
-    )
-
-    aligned_pred_points_flat, depth_scales = align_pred_gt_per_depth(
-        pred_depth=depth,
-        gt_depth=gt_depths.cpu().numpy(),
-        valid_mask=gt_masks.cpu().numpy(),
-        gt_extrinsics=gt_extrinsics,
-        gt_intrinsics=gt_intrinsics,
-        pred_extrinsic=pred_extrinsic,
-        pred_intrinsic=pred_intrinsic,
-        use_gt_extrinsic=False,
-    )
-
-    # aligned_pred_points_flat, mean_scale = align_pred_gt_by_pred_extrinsic(
-    #     pred_points_from_depth_flat=pred_points_from_depth_flat,
-    #     gt_extrinsics=gt_extrinsics,
-    #     pred_extrinsic=pred_extrinsic,
-    # )
-
-    pred_points_from_depth_flat = aligned_pred_points_flat
-
-    pred_conf = depth_conf  # [S, H, W]
-    pred_conf_flat = pred_conf.reshape(-1)
-
-    colors = gt_images.detach().cpu().permute(0, 2, 3, 1).numpy()
-    colors = (np.clip(colors, 0.0, 1.0) * 255).astype(np.uint8)
-    colors_flat = colors.reshape(-1, 3)
-
-    # 按置信度过滤点云
-    if cfg.use_conf_filter:
-        # 计算分位数阈值，例如 50% 分位数（中位数）
-        conf_threshold = np.percentile(pred_conf_flat, cfg.conf_percentile)
-        print(f"Conf threshold: {conf_threshold}")
-        mask = pred_conf_flat >= conf_threshold
-        print(f"Max conf: {pred_conf_flat.max()}, Min conf: {pred_conf_flat.min()}")
-
-        pred_points_from_depth_flat = pred_points_from_depth_flat[mask]
-        colors_flat = colors_flat[mask]
-
-    # gt_pts_from_depth_flat = gt_pts_from_depth_flat / scale
-
-    import open3d as o3d
-
-    pcd_gt = o3d.geometry.PointCloud()
-    pcd_gt.points = o3d.utility.Vector3dVector(gt_pts_from_depth_flat)
-    cl, ind = pcd_gt.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    pcd_gt = pcd_gt.select_by_index(ind)
-
-    pcd_pred = o3d.geometry.PointCloud()
-    pcd_pred.points = o3d.utility.Vector3dVector(pred_points_from_depth_flat)
-    pcd_pred.colors = o3d.utility.Vector3dVector(colors_flat.astype(np.float32) / 255.0)
-    cl, ind = pcd_pred.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    pcd_pred = pcd_pred.select_by_index(ind)
-
-    # icp
-    # icp_result = o3d.pipelines.registration.registration_icp(
-    #     pcd_pred,
-    #     pcd_gt,
-    #     10.0,
-    #     np.eye(4),
-    #     o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-    #     o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
-    # )
-    # print(icp_result.transformation)
-    # pcd_pred.transform(icp_result.transformation)
-
-    pred_points_from_depth_flat = np.asarray(pcd_pred.points)
-    gt_pts_from_depth_flat = np.asarray(pcd_gt.points)
-
-    chamfer_dist = compute_chamfer_distance(
-        pred_points_from_depth_flat, gt_pts_from_depth_flat, 1.0
-    )
+    if cfg.use_local_display:
+        display_point_clouds([transformed_pred_points, gt_points_world], [fused_colors, gt_points_colors_np], title="transformed pred points")
 
     if cfg.save_results:
         save_config_to_json(
@@ -748,11 +607,4 @@ if __name__ == "__main__":
             additional_configs={"token_fusion_strategy_cfg": token_fusion_strategy_cfg},
         )
 
-    if cfg.use_local_display:
-
-        import open3d as o3d
-
-        geometries = [pcd_gt, pcd_pred]
-        o3d.visualization.draw_geometries(geometries)
-
-
+    sys.exit()

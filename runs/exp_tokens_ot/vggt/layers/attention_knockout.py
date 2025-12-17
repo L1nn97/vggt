@@ -2,18 +2,8 @@ from __future__ import annotations
 
 import torch
 import numpy as np
-from typing import Tuple, Callable, Optional, Union, Dict, List
+from typing import List
 from torch import Tensor
-from enum import Enum
-from dataclasses import dataclass
-
-class KnockoutType(Enum):
-    RANDOM = 1
-    VISIBLE_SCORE = 2
-
-@dataclass
-class RandomKnockoutParams:
-    KnockoutType: KnockoutType
 
 def get_attention_map(x: Tensor, i: int, j: int, patch_row: int, patch_col: int, num_tokens_per_image_total: int, special_token_num: int, width: int, height: int):
     patch_idx = patch_row * width + patch_col
@@ -304,6 +294,8 @@ def top_k_preserved_knockout(x: Tensor, num_images: int, num_patches_per_image: 
         plt.show()
     
     print("attention map mean after knockout: ", x.mean().item())
+    print("attention map max after knockout: ", x.max().item())
+    print("attention map min after knockout: ", x.min().item())
     print("attention map sum after knockout: ", x.sum().item())
     # 清理中间变量以节省内存
     del preserve_mask, can_knockout_mask
@@ -326,7 +318,7 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
     attention_map_before_knockout, attention_map_after_knockout = None, None
     if debug_mode:
         display_i, display_j = 1, 3
-        patch_row, patch_col = 12, 18
+        patch_row, patch_col = 10, 14
         attention_map_before_knockout = get_attention_map(x, display_i, display_j, patch_row, patch_col, num_tokens_per_image_total, special_token_num, width, height)
 
     for i in range(num_images):
@@ -338,7 +330,6 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
                 mask = torch.ones(x.shape[-1], dtype=torch.bool, device=x.device)
                 if len(valid_keys) > 0:
                     mask[valid_keys] = False
-                min_value = x[:, :, query_idx, :].min()
                 x[:, :, query_idx, mask] = fill_value
     
     if debug_mode:
@@ -347,15 +338,9 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
         plt.imshow(np.concatenate([attention_map_before_knockout, attention_map_after_knockout], axis=0))
         plt.colorbar()
         plt.show()
-    
+        
     print("attention map mean after knockout: ", x.mean().item())
+    print("attention map max after knockout: ", x.max().item())
+    print("attention map min after knockout: ", x.min().item())
     print("attention map sum after knockout: ", x.sum().item())
     return x
-
-KnockoutMethodMap:Dict[KnockoutType, Callable] = {
-    KnockoutType.RANDOM: random_knockout,
-    KnockoutType.VISIBLE_SCORE: visible_score_knockout,
-}
-
-def get_attention_knockout_fn(params: Dict) -> Tuple[Callable]:
-    return KnockoutMethodMap[params.KnockoutType]
