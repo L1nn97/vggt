@@ -116,6 +116,108 @@ def render_depth_maps(mesh, poses, K, H, W, near=0.01, far=5000.0):
         # 返回空深度图作为fallback
         return [np.zeros((H, W), dtype=np.float32)]
 
+def filter_mesh_outliers(mesh, nb_neighbors=30, std_ratio=2.0, verbose=True):
+    """
+    使用统计离群点移除方法对mesh进行滤波，去除飞点
+    
+    参数:
+        mesh: trimesh.Trimesh 对象，输入mesh
+        nb_neighbors: int, 用于计算平均距离的邻居点数量（默认30）
+        std_ratio: float, 标准差倍数阈值，用于判断离群点（默认2.0）
+        verbose: bool, 是否打印详细信息（默认True）
+    
+    返回:
+        mesh_filtered: trimesh.Trimesh 对象，滤波后的mesh
+    """
+    if verbose:
+        print("\n" + "=" * 60)
+        print("Mesh Outlier Removal (去除飞点)")
+        print("=" * 60)
+    
+    # 将 mesh 的顶点转为 Open3D 点云
+    mesh_vertices = np.asarray(mesh.vertices)
+    if verbose:
+        print(f"原始 Mesh 顶点数: {len(mesh_vertices)}")
+    
+    o3d_pc = o3d.geometry.PointCloud()
+    o3d_pc.points = o3d.utility.Vector3dVector(mesh_vertices)
+    
+    # 使用统计离群点移除
+    _, mask_indices = o3d_pc.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors,
+        std_ratio=std_ratio
+    )
+    
+    # 转换索引为numpy数组并创建布尔掩码
+    mask_indices = np.asarray(list(mask_indices))
+    mask_np = np.zeros(len(mesh_vertices), dtype=bool)
+    mask_np[mask_indices] = True
+    filtered_vertices = mesh_vertices[mask_np]
+    
+    if verbose:
+        print(f"滤波后保留的顶点数: {len(filtered_vertices)}/{len(mesh_vertices)}")
+    
+    # 获取被保留顶点的原始索引
+    ind = np.where(mask_np)[0]
+    index_map = {orig_idx: new_idx for new_idx, orig_idx in enumerate(ind)}
+    
+    # 过滤面：只保留所有顶点都被保留的面
+    mask_faces = np.all(np.isin(mesh.faces, ind), axis=1)
+    filtered_faces = mesh.faces[mask_faces].copy()
+    
+    # 重映射面索引到新的顶点索引
+    for i in range(filtered_faces.shape[0]):
+        for j in range(3):
+            filtered_faces[i, j] = index_map[filtered_faces[i, j]]
+    
+    # 构建新的 mesh
+    mesh_filtered = trimesh.Trimesh(vertices=filtered_vertices, faces=filtered_faces, process=False)
+    
+    if verbose:
+        print(f"Mesh 滤波后顶点数: {len(mesh_filtered.vertices)}，面数: {len(mesh_filtered.faces)}")
+    
+    return mesh_filtered
+
+def filter_depth_outliers(depth, kernel_size=5, std_ratio=2.0, median_filter_size=5):
+    """
+    对深度图进行滤波，去除飞点并生成有效区域的mask
+    
+    参数:
+        depth: np.ndarray, 输入深度图，形状为 (H, W)
+        kernel_size: int, 用于统计分析的邻域大小（默认5）
+        std_ratio: float, 标准差倍数阈值，用于判断离群点（默认2.0）
+        median_filter_size: int, 中值滤波核大小（默认5）
+        verbose: bool, 是否打印详细信息（默认True）
+    
+    返回:
+        depth_filtered: np.ndarray, 滤波后的深度图
+        mask: np.ndarray, 有效区域的mask，1表示有效，0表示无效
+    """
+    H, W = depth.shape
+    depth_filtered = depth.copy().astype(np.float32)
+    
+    # 第一步：中值滤波去除小的飞点
+    if median_filter_size > 0:
+        depth_median = cv2.medianBlur(depth_filtered.astype(np.uint16), median_filter_size).astype(np.float32)
+        # 只对非零区域应用中值滤波
+        valid_mask = (depth_filtered > 0) & (depth_median > 0)
+        depth_filtered[valid_mask] = depth_median[valid_mask]
+
+    # 增加一次形态学，用于去除小的散点（开运算）
+    # 这里采用cv2的morphologyEx，先膨胀后腐蚀（开操作），有效地去掉孤立小区域
+    if median_filter_size > 0:
+        # 保证mask是uint8类型
+        morph_mask = valid_mask.astype(np.uint8)
+        kernel = np.ones((median_filter_size, median_filter_size), np.uint8)
+        # 开操作，去除小的孤立点区域
+        morph_mask = cv2.morphologyEx(morph_mask, cv2.MORPH_OPEN, kernel)
+        # 用形态学处理后的mask作为最终有效区域
+        valid_mask = (morph_mask == 1)
+        # 可选：将处理后的mask中为0的像素的深度设置为0
+        depth_filtered[~valid_mask] = 0
+
+    return depth_filtered, valid_mask
+
 def get_mesh_from_ply(ply_path, output_path, depth=9, density_thresh=0.1):
     """从PLY点云生成网格"""
     pcd = o3d.io.read_point_cloud(ply_path)
@@ -168,7 +270,7 @@ def get_available_scans(dtu_root):
     
     return sorted(scans)
 
-def process_single_scan(scan_id, dtu_root, output_root, light_condition=3, skip_existing=True):
+def process_single_scan(scan_id, dtu_root, output_root, light_condition=3, skip_existing=True, mesh_type='camp'):
     """处理单个扫描场景"""
     print(f"处理扫描场景 {scan_id}")
     
@@ -189,7 +291,8 @@ def process_single_scan(scan_id, dtu_root, output_root, light_condition=3, skip_
     dtu_rectified_dir = os.path.join(dtu_root, 'Rectified', f'scan{scan_id}')
     dtu_calibration_dir = os.path.join(dtu_root, 'Calibration', 'cal18')
     dtu_ply_path = os.path.join(dtu_root, 'Points', 'stl', f'stl{int(scan_id):03d}_total.ply')
-    dtu_mesh_path = os.path.join(dtu_root, 'Surfaces', 'furu', f'furu{int(scan_id):03d}_l3_surf_11_trim_8.ply')
+    # 支持可选的mesh路径类型: furu, camp, tola
+    dtu_mesh_path = os.path.join(dtu_root, 'Surfaces', mesh_type, f'{mesh_type}{int(scan_id):03d}_l3_surf_11_trim_8.ply')
 
     # 检查输入文件是否存在
     if not os.path.exists(dtu_rectified_dir):
@@ -285,6 +388,7 @@ def process_single_scan(scan_id, dtu_root, output_root, light_condition=3, skip_
                 
                 # 渲染深度图
                 depth = render_depth_maps(mesh, [camera_pose], intrinsic[:3, :3], H, W)[0]
+                depth, valid_mask = filter_depth_outliers(depth)
                 print(f'depth: {depth.shape} mean: {depth.mean()} std: {depth.std()}')
                 
                 # 保存深度图
@@ -317,6 +421,9 @@ def main():
                        help='要处理的扫描ID列表，或使用 "all" 处理所有可用扫描')
     parser.add_argument('--light_condition', type=int, default=3,
                        help='光照条件 (0-6)')
+    parser.add_argument('--mesh_type', type=str, default='camp',
+                       choices=['furu', 'camp', 'tola'],
+                       help='Mesh类型: furu, camp, 或 tola (默认: camp)')
     parser.add_argument('--skip_existing', action='store_true', default=False,
                        help='跳过已存在的扫描')
     parser.add_argument('--force_reprocess', action='store_true',
@@ -341,6 +448,7 @@ def main():
     print(f"输出目录: {args.output_root}")
     print(f"处理扫描: {scan_ids}")
     print(f"光照条件: {args.light_condition}")
+    print(f"Mesh类型: {args.mesh_type}")
     print(f"跳过已存在: {args.skip_existing}")
     print("-" * 50)
     
@@ -354,7 +462,7 @@ def main():
     for scan_id in tqdm(scan_ids, desc="处理扫描"):
         try:
             if process_single_scan(scan_id, args.dtu_root, args.output_root, 
-                                 args.light_condition, args.skip_existing):
+                                 args.light_condition, args.skip_existing, args.mesh_type):
                 success_count += 1
             else:
                 failed_scans.append(scan_id)
@@ -375,6 +483,7 @@ def main():
         'input_dir': args.dtu_root,
         'output_dir': args.output_root,
         'light_condition': args.light_condition,
+        'mesh_type': args.mesh_type,
         'total_scans': len(scan_ids),
         'successful_scans': success_count,
         'failed_scans': failed_scans,

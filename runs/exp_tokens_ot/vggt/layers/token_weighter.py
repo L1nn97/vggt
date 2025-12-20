@@ -458,18 +458,24 @@ class TokenFusionStrategy:
             target_attn_map = target_attn[5:].cpu().numpy().reshape(self.num_tokens_per_image_on_height, self.num_tokens_per_image_on_width)
             del target_attn_map_original, target_attn
             return target_attn_map.astype(np.float32)
+        
+        print(f"[visualize_attn_map_all_heads] shape: {attn_map.shape}, max: {attn_map.max()}, min: {attn_map.min()}")
+        attn_map_rescaled = 255.0 * (attn_map - attn_map.min(dim=-1, keepdim=True)[0]) / (attn_map.max(dim=-1, keepdim=True)[0] - attn_map.min(dim=-1, keepdim=True)[0] + 1e-8)
 
+        if attn_map_rescaled.shape[1] == 1: # 应对head被砍掉了的情况
+            attn_map_rescaled = attn_map_rescaled.unsqueeze(1).expand(-1, 16, -1, -1)
+        
         target_attn_maps = []
         for head in range(16):
-            target_attn_map = get_attn_map(attn_map, token_idx, image_idx, head)
+            target_attn_map = get_attn_map(attn_map_rescaled, token_idx, image_idx, head)
             target_attn_map = cv2.resize(target_attn_map, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-            blended_image = apply_heatmap(self.images[image_idx], target_attn_map, alpha = 0.8)
-            target_attn_maps.append(blended_image)
+            # blended_image = apply_heatmap(self.images[image_idx], target_attn_map, alpha = 0.8)
+            target_attn_maps.append(target_attn_map)
         
-        target_attn_map = get_attn_map(attn_map, token_idx, image_idx, None)
+        target_attn_map = get_attn_map(attn_map_rescaled, token_idx, image_idx, None)
         target_attn_map = cv2.resize(target_attn_map, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-        blended_image = apply_heatmap(self.images[image_idx], target_attn_map, alpha = 0.8)
-        target_attn_maps.append(blended_image)
+        # blended_image = apply_heatmap(self.images[image_idx], target_attn_map, alpha = 0.8)
+        target_attn_maps.append(target_attn_map)
 
         # plot by grid concat
         grid_img = np.concatenate(target_attn_maps, axis=1)

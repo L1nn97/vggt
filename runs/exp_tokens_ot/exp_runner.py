@@ -7,6 +7,7 @@ from typing import Tuple, List, Dict, Any
 from datetime import datetime
 
 import cv2
+import json
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -19,18 +20,18 @@ from vggt.models.vggt import VGGT
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.layers.token_weighter import TokenFusionStrategy, TokenFusionStrategyConfig
-from evaluation.depth_estimation import align_pred_gt_per_depth, align_pred_to_gt_without_shift
+from evaluation.depth_estimation import calculate_depth_scales, calculate_depth_scales_shift, process_depth_and_fuse_point_clouds
+from evaluation.pointmap_estimation import align_point_clouds
+from evaluation.filter import filter_depth_by_conf
 
 from evaluation.pose_estimation import (
     compute_pairwise_relative_errors,
     convert_poses_to_4x4,
 )
 
-from evaluation.pointmap_estimation import umeyama_alignment
-import json
 
 from evaluation.utils import *
-from evaluation.display import display_point_clouds, render_point_cloud_from_view
+from evaluation.display import display_point_clouds, render_point_cloud_from_view, display_depth_comparison, display_rgb_depth_overlay
 
 
 @dataclass
@@ -151,7 +152,7 @@ if __name__ == "__main__":
     # parser.add_argument('--target_size', type=int, nargs=2, default=[252,168])
     
     parser.add_argument('--dtu_root', type=str, default="/home/vision/ws/datasets/SampleSet/dtu_mvs")
-    parser.add_argument('--scan_id', type=int, default=4)
+    parser.add_argument('--scan_id', type=int, default=1)
     parser.add_argument('--num_views', type=int, default=4)
     parser.add_argument('--view_step', type=int, default=1)
     
@@ -293,9 +294,9 @@ if __name__ == "__main__":
     gt_masks = loader.load_masks()  # List[np.ndarray] 或类似格式
     gt_intrinsics, gt_extrinsics = loader.load_cameras()  # (S, 3, 3), (S, 4, 4)
 
-    R = gt_extrinsics[0][:3, :3]   # (3, 3)
-    t = gt_extrinsics[0][:3, 3]    # (3,)
-    gt_points_world = gt_points_np @ R.T + t
+    # R = gt_extrinsics[0][:3, :3]   # (3, 3)
+    # t = gt_extrinsics[0][:3, 3]    # (3,)
+    # gt_points_world = gt_points_np @ R.T + t
 
     import GPUtil
     if torch.cuda.is_available():
@@ -495,8 +496,6 @@ if __name__ == "__main__":
     pred_extrinsic = pred_extrinsic.detach().squeeze(0).cpu().numpy()
     pred_intrinsic = pred_intrinsic.detach().squeeze(0).cpu().numpy()
 
-    from evaluation.point_cloud_fusion import fusion_point_cloud
-    from evaluation.filter import filter_depth_by_conf, stat_filter, remove_Nan_Zero_Inf
 
     depth, conf_mask = filter_depth_by_conf(depth,
                                             depth_conf, 
@@ -509,80 +508,35 @@ if __name__ == "__main__":
         conf_mask,
     )
 
-    # valid_mask_display = np.concatenate([i.squeeze().numpy() for i in valid_mask])
-    # plt.imshow(valid_mask_display)
-    # plt.show()
+    transformed_pred_points, fused_colors, gt_pnts, gt_pnts_colors = align_point_clouds(
+        depth, pred_extrinsic, pred_intrinsic, gt_depths, gt_extrinsics, gt_intrinsics, gt_images, valid_mask
+    )
 
-    from evaluation.depth_estimation import calculate_depth_scales
-    scales_by_depth = calculate_depth_scales(depth.squeeze().cpu().numpy(), 
-                                             gt_depths.squeeze().cpu().numpy(), 
-                                             valid_mask.squeeze().cpu().numpy())
-    mean_scale = np.mean(scales_by_depth)
-    print(f"scales_by_depth: {scales_by_depth}")
-    print(f"mean_scale: {mean_scale}")
-
-    N = depth.shape[0]
-    for i in range(N):
-        depth[i] = depth[i] * scales_by_depth[i]
-        pred_extrinsic[i][:3, 3] = pred_extrinsic[i][:3, 3] * scales_by_depth[i]
-
-    fused_points, fused_colors = fusion_point_cloud(depth, 
-                                                    pred_extrinsic, 
-                                                    pred_intrinsic, 
-                                                    gt_images, 
-                                                    dist_thresh=7.0, 
-                                                    num_consist=2, 
-                                                    scale_factor=1.0)
-
-    fused_points, fused_colors = remove_Nan_Zero_Inf(fused_points, fused_colors)
-    gt_points_world, gt_points_colors_np = remove_Nan_Zero_Inf(gt_points_world, gt_points_colors_np)
-
-    if cfg.use_stat_filter:
-        fused_points, fused_colors, fused_ind = stat_filter(fused_points, fused_colors, nb_neighbors=20, std_ratio=2.0)
-        gt_points_world, gt_points_colors_np, gt_ind = stat_filter(gt_points_world, gt_points_colors_np, nb_neighbors=20, std_ratio=2.0)
-
-    print(f"fused_points shape: {fused_points.shape}, "
-          f"gt_points_world shape: {gt_points_world.shape}")
-
-    from evaluation.registration import register_point_clouds_open3d_icp
-    if cfg.use_icp_alignment:
-        transformed_pred_points, transformation = register_point_clouds_open3d_icp(fused_points, gt_points_world)
-    else:
-        transformed_pred_points, transformation = fused_points, np.eye(4)
-
-    print(f"transformed_pred_points shape: {transformed_pred_points.shape}, ")
-
-    search_best_scale = False
-    if search_best_scale:
-        all_chamfer_dists = []
-        for i in range(-50, 10, 1):
-            print(f"--------------------{i}--------------------")
-            chamfer_dist = compute_chamfer_distance(
-                np.asarray(pred_cloud.points) * (mean_scale + i*0.1), np.asarray(gt_cloud.points), 1.0,
-            )
-            all_chamfer_dists.append(chamfer_dist)
-
-        plt.plot(all_chamfer_dists)
-        plt.show()
-
-        min_chamfer_dist = np.min(all_chamfer_dists)
-        min_chamfer_dist_idx = np.argmin(all_chamfer_dists)
-        print(f"min_chamfer_dist: {min_chamfer_dist}")
-        print(f"min_chamfer_dist_idx: {min_chamfer_dist_idx}")
-
-        pred_cloud.points = o3d.utility.Vector3dVector(np.asarray(pred_cloud.points) * (mean_scale + min_chamfer_dist_idx*0.1))
 
     chamfer_dist = compute_chamfer_distance(
-        transformed_pred_points, gt_points_world, 2.0, True if cfg.use_local_display else False
+        transformed_pred_points, gt_pnts, 2.0, True if cfg.use_local_display else False
     )
-    print(f"chamfer_dist: {chamfer_dist}")
+
+    # transformed_pred_points, transformation, fused_points, fused_colors = process_depth_and_fuse_point_clouds(
+    #     depth, gt_depths, valid_mask, pred_extrinsic, pred_intrinsic,
+    #     gt_images, gt_points_np, gt_points_colors_np, cfg
+    # )
+
+    # chamfer_dist = compute_chamfer_distance(
+    #     transformed_pred_points, gt_points_np, 3.0, True if cfg.use_local_display else False
+    # )
 
     if cfg.use_local_display:
         display_point_clouds(
-            [transformed_pred_points, gt_points_world],
-            [fused_colors, gt_points_colors_np],
+            [transformed_pred_points],
+            [fused_colors],
             title="transformed pred points",
         )
+        # display_point_clouds(
+        #     [transformed_pred_points, gt_points_np],
+        #     [fused_colors, gt_points_colors_np],
+        #     title="transformed pred points",
+        # )
 
     if cfg.save_results:
         # 1) 保存 Chamfer Distance 和推理时间到文本文件
@@ -609,13 +563,13 @@ if __name__ == "__main__":
         try:
             # 只渲染第一个视角
             H, W = gt_images.shape[-2], gt_images.shape[-1]
-            view_idx = 0
+            view_idx = 1
             
             render_path = os.path.join(save_root, f"transformed_pred_vs_gt_cam{view_idx}.png")
             render_point_cloud_from_view(
                 pred_points_world=transformed_pred_points,
                 pred_colors=fused_colors,
-                gt_points_world=gt_points_world,
+                gt_points_world=gt_points_np,
                 gt_colors=gt_points_colors_np,
                 intrinsic=pred_intrinsic[view_idx],
                 extrinsic=pred_extrinsic[view_idx],

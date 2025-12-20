@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import imageio
 import matplotlib.pyplot as plt
+from scipy.linalg import svd
 
 np.set_printoptions(threshold = np.inf) 
 np.set_printoptions(suppress = True)
@@ -592,72 +593,57 @@ def compute_chamfer_distance(points_pred, points_gt, max_dist=1.0, display_outli
 
 # Import umeyama_alignment for internal use in eval_trajectory
 def umeyama_alignment(src_points, dst_points, estimate_scale=True):
-    MAX_POINTS = 10000
+    MAX_POINTS = 1000
+    
     if src_points.shape[0] > MAX_POINTS:
         np.random.seed(33)  # Fix random seed
         indices = np.random.choice(src_points.shape[0], MAX_POINTS, replace=False)
         src = src_points[indices]
-
-    if dst_points.shape[0] > MAX_POINTS:
-        np.random.seed(33)  # Fix random seed
-        indices = np.random.choice(dst_points.shape[0], MAX_POINTS, replace=False)
         dst = dst_points[indices]
 
     # Compute centroids
-    src_mean = src.mean(axis=1, keepdims=True)
-    dst_mean = dst.mean(axis=1, keepdims=True)
+    src_mean = src.mean(axis=0, keepdims=True)
+    dst_mean = dst.mean(axis=0, keepdims=True)
 
     # Center the point clouds
     src_centered = src - src_mean
     dst_centered = dst - dst_mean
 
     # Compute covariance matrix
-    cov = dst_centered @ src_centered.T
+    cov = dst_centered.T @ src_centered
 
-    try:
-        # Singular Value Decomposition
-        U, D, Vt = svd(cov)
-        V = Vt.T
+    U, D, Vt = svd(cov)
+    V = Vt.T
 
-        # Handle reflection case
-        det_UV = np.linalg.det(U @ V.T)
-        S = np.eye(3)
-        if det_UV < 0:
-            S[2, 2] = -1
+    # Handle reflection case
+    det_UV = np.linalg.det(U @ V.T)
+    S = np.eye(3)
+    if det_UV < 0:
+        S[2, 2] = -1
 
-        # Compute rotation matrix
-        R = U @ S @ V.T
+    # Compute rotation matrix
+    R = U @ S @ V.T
 
-        if estimate_scale:
-            # Compute scale factor - fix dimension issue
-            src_var = np.sum(src_centered * src_centered)
-            if src_var < 1e-10:
-                print(
-                    "Warning: Source point cloud variance close to zero, setting scale factor to 1.0"
-                )
-                scale = 1.0
-            else:
-                # Fix potential dimension issue with np.diag(S)
-                # Use diagonal elements directly
-                scale = np.sum(D * np.diag(S)) / src_var
-        else:
+    if estimate_scale:
+        # Compute scale factor - fix dimension issue
+        src_var = np.sum(src_centered * src_centered)
+        if src_var < 1e-10:
+            print(
+                "Warning: Source point cloud variance close to zero, setting scale factor to 1.0"
+            )
             scale = 1.0
-
-        # Compute translation vector
-        t = dst_mean.ravel() - scale * (R @ src_mean).ravel()
-
-        return scale, R, t
-
-    except Exception as e:
-        print(f"Error in umeyama_alignment computation: {e}")
-        print(
-            "Returning default transformation: scale=1.0, rotation=identity matrix, translation=centroid difference"
-        )
-        # Return default transformation
+        else:
+            # Fix potential dimension issue with np.diag(S)
+            # Use diagonal elements directly
+            scale = np.sum(D * np.diag(S)) / src_var
+    else:
         scale = 1.0
-        R = np.eye(3)
-        t = (dst_mean - src_mean).ravel()
-        return scale, R, 
+
+    # Compute translation vector
+    t = dst_mean.ravel() - scale * (R @ src_mean.T).ravel()
+
+    return scale, R, t
+
 
 def align_point_clouds_scale(source_pc, target_pc):
     # Compute bounding box sizes of point clouds

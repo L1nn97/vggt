@@ -169,21 +169,32 @@ class RotaryPositionEmbedding2D(nn.Module):
         # Validate inputs
         assert tokens.size(-1) % 2 == 0, "Feature dimension must be even"
         assert positions.ndim == 3 and positions.shape[-1] == 2, "Positions must have shape (batch_size, n_tokens, 2)"
-        # positions = positions *  2
 
         # Compute feature dimension for each spatial direction
         feature_dim = tokens.size(-1) // 2
 
         # Get frequency components
-        max_position = int(positions.max()) + 1
-        cos_comp, sin_comp = self._compute_frequency_components(feature_dim, max_position, tokens.device, tokens.dtype)
+        # Note: positions are scaled by 2.0 (vertical) and 2.05 (horizontal) before embedding,
+        # so we need to compute max_position based on the scaled values to avoid index out of bounds
+        vertical_scale = 1.0
+        horizontal_scale = 1.0
+        # vertical_scale *= 2.0
+        # horizontal_scale *= 2.05
+        max_position_scaled = max(
+            int(positions[..., 0].max() * vertical_scale) + 1,
+            int(positions[..., 1].max() * horizontal_scale) + 1
+        )
+        cos_comp, sin_comp = self._compute_frequency_components(feature_dim, max_position_scaled, tokens.device, tokens.dtype)
 
         # Split features for vertical and horizontal processing
         vertical_features, horizontal_features = tokens.chunk(2, dim=-1)
 
         # Apply RoPE separately for each dimension
-        vertical_features = self._apply_1d_rope(vertical_features, positions[..., 0], cos_comp, sin_comp)
-        horizontal_features = self._apply_1d_rope(horizontal_features, positions[..., 1], cos_comp, sin_comp)
+        # Convert scaled positions to integers for embedding lookup
+        vertical_positions = (positions[..., 0] * vertical_scale).long()
+        horizontal_positions = (positions[..., 1] * horizontal_scale).long()
+        vertical_features = self._apply_1d_rope(vertical_features, vertical_positions, cos_comp, sin_comp)
+        horizontal_features = self._apply_1d_rope(horizontal_features, horizontal_positions, cos_comp, sin_comp)
 
         # Combine processed features
         return torch.cat((vertical_features, horizontal_features), dim=-1)

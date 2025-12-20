@@ -284,6 +284,7 @@ class DTUScanLoader:
                 self.crop_needed = crop_x > 0 or crop_y > 0
                 final_w, final_h = map(int, self.requested_target_size)
             else:
+                self.crop_needed = False  # keep_ratio=False 时不裁剪
                 final_w, final_h = resize_w, resize_h
 
             self.W, self.H = final_w, final_h

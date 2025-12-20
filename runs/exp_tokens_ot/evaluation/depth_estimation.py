@@ -1,6 +1,7 @@
 import argparse
 import os
 import numpy as np
+from evaluation.filter import remove_Nan_Zero_Inf, stat_filter
 
 def calculate_depth_error(
     pred_depth: np.ndarray,
@@ -107,21 +108,6 @@ def align_pred_to_gt(
 
     aligned_pred_depth = scale * pred_depth + shift
     return scale, shift, aligned_pred_depth
-
-#   valid_mask = torch.logical_and(
-#       gt_depth.squeeze().cpu() > 1e-3,     # filter out black background
-#       predictions["depth_conf"].squeeze().cpu() > args.depth_conf_thres
-#   )
-#   valid_mask = valid_mask.numpy()[0]  # Take first item in batch
-  
-
-#   align_mask = valid_mask.copy()
-  
-#   scale, shift, aligned_pred_depth = align_pred_to_gt(
-#       depth_map.squeeze()[0].cpu().numpy(), 
-#       gt_depth.squeeze()[0].cpu().numpy(), 
-#       align_mask
-#   )
 
 
 def align_pred_to_gt_without_shift(
@@ -503,6 +489,24 @@ def calculate_depth_scales(
         scales.append(scale)
     return scales
 
+def calculate_depth_scales_shift(
+    pred_depth: np.ndarray,
+    gt_depth: np.ndarray,
+    valid_mask: np.ndarray,
+):
+    scales = []
+    shifts = []
+    N = pred_depth.shape[0]
+    for i in range(N):
+        scale, shift, _ = align_pred_to_gt(
+            pred_depth=pred_depth[i],
+            gt_depth=gt_depth[i],
+            valid_mask=valid_mask[i],
+        )
+        scales.append(scale)
+        shifts.append(shift)
+    return scales, shifts
+
 def align_pred_gt_per_depth(
     pred_depth: np.ndarray,
     gt_depth: np.ndarray,
@@ -562,6 +566,90 @@ def align_pred_gt_by_pred_extrinsic(
     mean_scale = np.mean(scales)
     aligned_pred_points_flat = pred_points_from_depth_flat * mean_scale
     return aligned_pred_points_flat, mean_scale
+
+def process_depth_and_fuse_point_clouds(depth, gt_depths, valid_mask, pred_extrinsic, pred_intrinsic,
+                                       gt_images, gt_points_world, gt_points_colors_np, cfg):
+    """
+    处理深度图并融合点云的完整流程
+
+    Args:
+        depth: 预测深度图张量，形状 (B, H, W)
+        gt_depths: 真实深度图张量，形状 (B, H, W)
+        valid_mask: 有效性掩码张量，形状 (B, H, W)
+        pred_extrinsic: 预测相机外参，形状 (B, 3, 4)
+        pred_intrinsic: 预测相机内参，形状 (B, 3, 3)
+        gt_images: 真实图像张量，形状 (B, 3, H, W)
+        gt_points_world: 真实世界点云，形状 (N, 3)
+        gt_points_colors_np: 真实点云颜色，形状 (N, 3)
+        cfg: 配置对象
+
+    Returns:
+        tuple: (transformed_pred_points, transformation, fused_points, fused_colors)
+            - transformed_pred_points: ICP对齐后的预测点云
+            - transformation: ICP变换矩阵
+            - fused_points: 融合后的预测点云
+            - fused_colors: 融合后的预测点云颜色
+    """
+    # 计算深度缩放因子
+    scales_by_depth = calculate_depth_scales(depth.squeeze().cpu().numpy(),
+                                           gt_depths.squeeze().cpu().numpy(),
+                                           valid_mask.squeeze().cpu().numpy())
+
+    mean_scale = np.mean(scales_by_depth)
+
+    # 应用深度缩放和掩码
+    depth = depth.clone()
+    depth[~valid_mask] = 0
+    gt_depths = gt_depths.clone()
+    gt_depths[~valid_mask] = 0
+
+    N = depth.shape[0]
+    for i in range(N):
+        depth[i] = depth[i] * scales_by_depth[i]
+        pred_extrinsic[i][:3, 3] = pred_extrinsic[i][:3, 3] * scales_by_depth[i]
+
+    # 显示深度对比
+    for view_idx in range(N):
+        gt_image = gt_images[view_idx].cpu().numpy().transpose(1, 2, 0)  # (H, W, 3)
+        depth_img = depth[view_idx].cpu().numpy()  # (H, W)
+        gt_depth_img = gt_depths[view_idx].cpu().numpy()  # (H, W)
+
+        # from evaluation.display import display_rgb_depth_overlay, display_depth_comparison
+        # display_rgb_depth_overlay(gt_image, depth_img, view_idx=view_idx)
+        # display_depth_comparison(depth_img, gt_depth_img, view_idx=view_idx)
+
+    # 点云融合
+    from evaluation.point_cloud_fusion import fusion_point_cloud
+    fused_points, fused_colors = fusion_point_cloud(depth,
+                                                  pred_extrinsic,
+                                                  pred_intrinsic,
+                                                  gt_images,
+                                                  dist_thresh=3.0,
+                                                  num_consist=2,
+                                                  scale_factor=1.0)
+
+    # 清理无效点
+    fused_points, fused_colors = remove_Nan_Zero_Inf(fused_points, fused_colors)
+    gt_points_world, gt_points_colors_np = remove_Nan_Zero_Inf(gt_points_world, gt_points_colors_np)
+
+    # 统计滤波
+    if cfg.use_stat_filter:
+        fused_points, fused_colors, fused_ind = stat_filter(fused_points, fused_colors, nb_neighbors=20, std_ratio=2.0)
+        gt_points_world, gt_points_colors_np, gt_ind = stat_filter(gt_points_world, gt_points_colors_np, nb_neighbors=20, std_ratio=2.0)
+
+    # print(f"fused_points shape: {fused_points.shape}, "
+    #       f"gt_points_world shape: {gt_points_world.shape}")
+
+    # ICP对齐
+    if cfg.use_icp_alignment:
+        from evaluation.registration import register_point_clouds_open3d_icp
+        transformed_pred_points, transformation = register_point_clouds_open3d_icp(fused_points, gt_points_world)
+    else:
+        transformed_pred_points, transformation = fused_points, np.eye(4)
+
+    # print(f"transformed_pred_points shape: {transformed_pred_points.shape}, ")
+
+    return transformed_pred_points, transformation, fused_points, fused_colors
 
 
 if __name__ == "__main__":
