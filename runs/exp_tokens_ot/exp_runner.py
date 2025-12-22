@@ -639,12 +639,44 @@ if __name__ == "__main__":
     # 保存汇总结果到JSON
     if cfg.save_results and save_root:
         summary_path = os.path.join(save_root, "evaluation_summary.json")
+        
+        # 创建一个可序列化的结果副本，排除numpy数组等大型数据结构
+        def make_json_serializable(obj):
+            """递归地将numpy数组和其他不可序列化的对象转换为可序列化的格式"""
+            if isinstance(obj, np.ndarray):
+                return None  # 排除大型数组，它们已经保存为.npy文件
+            elif isinstance(obj, (np.integer, np.floating)):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {k: make_json_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [make_json_serializable(item) for item in obj]
+            elif isinstance(obj, (str, int, float, bool, type(None))):
+                return obj
+            else:
+                return str(obj)  # 其他类型转换为字符串
+        
+        # 清理结果，只保留可序列化的字段
+        serializable_successful_results = []
+        for r in successful_results:
+            serializable_r = {
+                'scan_id': r['scan_id'],
+                'chamfer_dist': float(r['chamfer_dist']),
+                'inference_time_ms': float(r['inference_time_ms']),
+                'mem_before_GB': float(r['mem_before_GB']),
+                'peak_memory_GB': float(r['peak_memory_GB']),
+                'additional_peak_memory_GB': float(r['additional_peak_memory_GB']),
+            }
+            serializable_successful_results.append(serializable_r)
+        
+        serializable_failed_results = failed_results  # 失败结果应该已经是可序列化的
+        
         with open(summary_path, 'w') as f:
             json.dump({
                 'timestamp': timestamp,
                 'scan_ids': scan_ids,
-                'successful_results': successful_results,
-                'failed_results': failed_results,
+                'successful_results': serializable_successful_results,
+                'failed_results': serializable_failed_results,
                 'summary': {
                     'total_scans': len(results),
                     'successful_scans': len(successful_results),
