@@ -1,5 +1,6 @@
 ```python
 python exp_runner.py \
+    --scan_ids 1 \
     --num_views 5 \
     --enable_token_merge False \
     --knockout_layer_idx 1 2 3 4 \
