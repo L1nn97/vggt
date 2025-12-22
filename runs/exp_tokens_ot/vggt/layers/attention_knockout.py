@@ -9,12 +9,8 @@ def get_attention_map(x: Tensor, i: int, j: int, patch_row: int, patch_col: int,
     patch_idx = patch_row * width + patch_col
     selected_attention_map = x[:, :, num_tokens_per_image_total * i + special_token_num + patch_idx, num_tokens_per_image_total * j + special_token_num: num_tokens_per_image_total * (j+1)]
     selected_attention_map = selected_attention_map.reshape(16, height, width).cpu().numpy()
-    grid_rows, grid_cols = 4, 4
-    selected_attention_map_grid = selected_attention_map.reshape(grid_rows, grid_cols, height, width)
-    grid_image = np.concatenate([
-        np.concatenate([selected_attention_map_grid[i, j] for j in range(grid_cols)], axis=1)
-        for i in range(grid_rows)
-    ], axis=0)
+    # 将16个head按行排列（1行16列）
+    grid_image = np.concatenate([selected_attention_map[head_idx] for head_idx in range(16)], axis=1)
     return grid_image
 
 def random_knockout(x: Tensor, num_images: int, num_patches_per_image: int, width: int, height: int, ratio: float, fill_value: float = float('-inf')) -> Tensor:
@@ -261,9 +257,9 @@ def top_k_preserved_knockout(x: Tensor, num_images: int, num_patches_per_image: 
 
     attention_map_before_knockout, attention_map_after_knockout = None, None
     if debug_mode:
-        i, j = 1, 3
-        patch_row, patch_col = 12, 18
-        attention_map_before_knockout = get_attention_map(x, i, j, patch_row, patch_col, num_tokens_per_image_total, special_token_num, width, height)
+        display_i, display_j = 0, 3
+        patch_row, patch_col = 9, 14
+        attention_map_before_knockout = get_attention_map(x, display_i, display_j, patch_row, patch_col, num_tokens_per_image_total, special_token_num, width, height)
 
     preserve_mask = torch.zeros(x.shape[-2:], device="cpu")
     special_token_start_idx = torch.arange(0, num_images * num_tokens_per_image_total, num_tokens_per_image_total)
@@ -287,16 +283,25 @@ def top_k_preserved_knockout(x: Tensor, num_images: int, num_patches_per_image: 
 
 
     if debug_mode:
-        attention_map_after_knockout = get_attention_map(x, i, j, patch_row, patch_col, num_tokens_per_image_total, special_token_num, width, height)
+        attention_map_after_knockout = get_attention_map(x, display_i, display_j, patch_row, patch_col, num_tokens_per_image_total, special_token_num, width, height)
         from matplotlib import pyplot as plt
         plt.imshow(np.concatenate([attention_map_before_knockout, attention_map_after_knockout], axis=0))
         plt.colorbar()
         plt.show()
     
-    print("attention map mean after knockout: ", x.mean().item())
-    print("attention map max after knockout: ", x.max().item())
-    print("attention map min after knockout: ", x.min().item())
-    print("attention map sum after knockout: ", x.sum().item())
+    # 排除-inf值进行统计
+    valid_mask = torch.isfinite(x)
+    if valid_mask.any():
+        valid_x = x[valid_mask]
+        print("attention map mean after knockout: ", valid_x.mean().item())
+        print("attention map max after knockout: ", valid_x.max().item())
+        print("attention map min after knockout: ", valid_x.min().item())
+        print("attention map sum after knockout: ", valid_x.sum().item())
+    else:
+        print("attention map mean after knockout: all values are -inf")
+        print("attention map max after knockout: all values are -inf")
+        print("attention map min after knockout: all values are -inf")
+        print("attention map sum after knockout: all values are -inf")
     # 清理中间变量以节省内存
     del preserve_mask, can_knockout_mask
     if 'x_reshaped' in locals():
@@ -312,13 +317,13 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
     print("attention map sum before knockout: ", x.sum().item())
 
     B, H, N, _ = x.shape 
-    special_token_num = 5
+    special_token_num = 4
     num_tokens_per_image_total = num_patches_per_image + special_token_num
 
     attention_map_before_knockout, attention_map_after_knockout = None, None
     if debug_mode:
-        display_i, display_j = 1, 3
-        patch_row, patch_col = 10, 14
+        display_i, display_j = 0, 3
+        patch_row, patch_col = 9, 14
         attention_map_before_knockout = get_attention_map(x, display_i, display_j, patch_row, patch_col, num_tokens_per_image_total, special_token_num, width, height)
 
     for i in range(num_images):
@@ -330,7 +335,16 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
                 mask = torch.ones(x.shape[-1], dtype=torch.bool, device=x.device)
                 if len(valid_keys) > 0:
                     mask[valid_keys] = False
+                
+                # 从要knockout的位置中随机保留10%, 加入这个之后虽然效果还是打不过topk，但是至少不会collapse了
+                knockout_indices = torch.where(mask)[0]  # mask=True的位置，即要knockout的位置
+                if len(knockout_indices) > 0:
+                    num_to_preserve = max(1, int(len(knockout_indices) * 0.1))  # 保留10%
+                    preserve_indices = knockout_indices[torch.randperm(len(knockout_indices), device=x.device)[:num_to_preserve]]
+                    mask[preserve_indices] = False  # 将这些位置标记为保留（不knockout）
+                
                 x[:, :, query_idx, mask] = fill_value
+                
     
     if debug_mode:
         attention_map_after_knockout = get_attention_map(x, display_i, display_j, patch_row, patch_col, num_tokens_per_image_total, special_token_num, width, height)
@@ -339,8 +353,17 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
         plt.colorbar()
         plt.show()
         
-    print("attention map mean after knockout: ", x.mean().item())
-    print("attention map max after knockout: ", x.max().item())
-    print("attention map min after knockout: ", x.min().item())
-    print("attention map sum after knockout: ", x.sum().item())
+    # 排除-inf值进行统计
+    valid_mask = torch.isfinite(x)
+    if valid_mask.any():
+        valid_x = x[valid_mask]
+        print("attention map mean after knockout: ", valid_x.mean().item())
+        print("attention map max after knockout: ", valid_x.max().item())
+        print("attention map min after knockout: ", valid_x.min().item())
+        print("attention map sum after knockout: ", valid_x.sum().item())
+    else:
+        print("attention map mean after knockout: all values are -inf")
+        print("attention map max after knockout: all values are -inf")
+        print("attention map min after knockout: all values are -inf")
+        print("attention map sum after knockout: all values are -inf")
     return x
