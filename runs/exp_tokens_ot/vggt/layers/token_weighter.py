@@ -560,7 +560,7 @@ class TokenFusionStrategy:
         # plt.show()
 
     def calculate_corresponding_attention_mask(self) -> list[list[int]]:
-        stride = 5
+        stride = 1
         def calc_corres_attn_mask_token_i(img_idx: int, row_idx: int, col_idx: int):
             patch_center_uv = (col_idx * 14 + 7, row_idx * 14 + 7)
             patch_center_world_coords = self.world_coords[img_idx][patch_center_uv[1], patch_center_uv[0]]

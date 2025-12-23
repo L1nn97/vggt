@@ -49,16 +49,6 @@ def random_knockout(x: Tensor, num_images: int, num_patches_per_image: int, widt
     print("attention map min before knockout: ", x.min().item())
     print("attention map sum before knockout: ", x.sum().item())
 
-    num_can_knockout = can_knockout_mask.sum().item()
-    if num_can_knockout == 0:
-        print("No can knockout positions, return original tensor")
-        return x
-    
-    num_to_knockout = int(num_can_knockout * ratio)
-    if num_to_knockout == 0:
-        print("No need to knockout, return original tensor")
-        return x
-
     random_values = torch.rand_like(x, dtype=torch.float32, device="cpu")
     knockout_positions = can_knockout_mask & (random_values < ratio)
     x.masked_fill_(knockout_positions.to(x.device), fill_value)
@@ -69,11 +59,29 @@ def random_knockout(x: Tensor, num_images: int, num_patches_per_image: int, widt
         plt.imshow(np.concatenate([attention_map_before_knockout, attention_map_after_knockout], axis=0))
         plt.colorbar()
         plt.show()
-    
+    # print(1)
+    # 排除-inf值进行统计（不整体搬CPU）
+    # valid_mask = torch.isfinite(x)
+    # if valid_mask.any():
+    #     valid_x = x[valid_mask]
+    #     num_preserved = valid_mask.sum().item()
+    #     total_entries = x.numel()
+    #     print(f"attention map entries preserved: {num_preserved} / {total_entries} ({num_preserved/total_entries*100:.2f}%)")
     print("attention map mean after knockout: ", x.mean().item())
+    print("attention map max after knockout: ", x.max().item())
+    print("attention map min after knockout: ", x.min().item())
     print("attention map sum after knockout: ", x.sum().item())
-    print("knockout ratio: ", knockout_positions.sum().item() / knockout_positions.numel())
-    del can_knockout_mask, random_values, knockout_positions
+    #     print("knockout ratio: ", knockout_positions.sum().item() / knockout_positions.numel())
+    # else:
+    #     total_entries = x.numel()
+    #     print(f"attention map entries preserved: 0 / {total_entries} (0.00%)")
+    #     print("attention map mean after knockout: all values are -inf")
+    #     print("attention map max after knockout: all values are -inf")
+    #     print("attention map min after knockout: all values are -inf")
+    #     print("attention map sum after knockout: all values are -inf")
+    #     print("knockout ratio: ", knockout_positions.sum().item() / knockout_positions.numel())
+    # 清理临时变量
+    del can_knockout_mask, knockout_positions
     return x
 
 def visible_score_knockout(x: Tensor, num_images: int, num_patches_per_image: int, width: int, height: int,
@@ -293,11 +301,16 @@ def top_k_preserved_knockout(x: Tensor, num_images: int, num_patches_per_image: 
     valid_mask = torch.isfinite(x)
     if valid_mask.any():
         valid_x = x[valid_mask]
+        num_preserved = valid_mask.sum().item()
+        total_entries = x.numel()
+        print(f"attention map entries preserved: {num_preserved} / {total_entries} ({num_preserved/total_entries*100:.2f}%)")
         print("attention map mean after knockout: ", valid_x.mean().item())
         print("attention map max after knockout: ", valid_x.max().item())
         print("attention map min after knockout: ", valid_x.min().item())
         print("attention map sum after knockout: ", valid_x.sum().item())
     else:
+        total_entries = x.numel()
+        print(f"attention map entries preserved: 0 / {total_entries} (0.00%)")
         print("attention map mean after knockout: all values are -inf")
         print("attention map max after knockout: all values are -inf")
         print("attention map min after knockout: all values are -inf")
@@ -317,7 +330,7 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
     print("attention map sum before knockout: ", x.sum().item())
 
     B, H, N, _ = x.shape 
-    special_token_num = 4
+    special_token_num = 5
     num_tokens_per_image_total = num_patches_per_image + special_token_num
 
     attention_map_before_knockout, attention_map_after_knockout = None, None
@@ -357,11 +370,16 @@ def corres_mask_knockout(x: Tensor, num_images: int, num_patches_per_image: int,
     valid_mask = torch.isfinite(x)
     if valid_mask.any():
         valid_x = x[valid_mask]
+        num_preserved = valid_mask.sum().item()
+        total_entries = x.numel()
+        print(f"attention map entries preserved: {num_preserved} / {total_entries} ({num_preserved/total_entries*100:.2f}%)")
         print("attention map mean after knockout: ", valid_x.mean().item())
         print("attention map max after knockout: ", valid_x.max().item())
         print("attention map min after knockout: ", valid_x.min().item())
         print("attention map sum after knockout: ", valid_x.sum().item())
     else:
+        total_entries = x.numel()
+        print(f"attention map entries preserved: 0 / {total_entries} (0.00%)")
         print("attention map mean after knockout: all values are -inf")
         print("attention map max after knockout: all values are -inf")
         print("attention map min after knockout: all values are -inf")
